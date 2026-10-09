@@ -1,4 +1,4 @@
-/* cc -Igodstack/Peak tests/peak_no_gamepad.c -o /tmp/velocitty-peak-no-gamepad -ldl -lpthread -lm */
+/* cc -Ivendor/godstack/Peak tests/peak_no_gamepad.c -o /tmp/velocitty-peak-no-gamepad -ldl -lpthread -lm */
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,7 +17,7 @@ tracked_open(const char *path, int flags, ...)
 
 #define open tracked_open
 #define PEAK_NO_GAMEPAD
-#include "../godstack/Peak/peak.c"
+#include "../vendor/godstack/Peak/peak.c"
 #undef open
 
 int

@@ -1,0 +1,209 @@
+velocitty headless CPU benchmark v2
+utc 2026-10-09T08:05:06Z
+git 6b99d91ca227 status=dirty
+compiler Zig 0.16.0 optimize=ReleaseFast target=x86_64-linux-gnu cpu-target=skylake
+host cpu model name	: Intel(R) Core(TM) i7-10610U CPU @ 1.80GHz
+settings quick=false samples=5 warmup=1 iterations=10 ring=65536 size_px=16 workload=deterministic-v2 (no random seed)
+clock=monotonic awake; min/median/p95/max and spread=(max-min)/median are batch-average ns/op.
+Setup/reset/checksums excluded; timing, memory barriers and loop bookkeeping included.
+No PTY/readPTY, Peak, scheduling, GPU/compositor, or input-to-echo measured.
+Byte rates describe the named input/copy domain, never painted bytes for skip/dirty frames.
+
+font /usr/share/fonts/liberation/LiberationMono-Regular.ttf bytes=319624 hash=69d5fc9a40d1d074 cell=10x19; regular face only, no shaping/fallback faces
+ring mirrored=true; screen=80x24 framebuffer=800x456
+
+input ASCII: corpus/raw=65472 B; parse/VT start with all bytes retained, no loss
+  synthetic ring overwrite copy
+    min=0.008070 median=0.008189 p95=0.008353 max=0.008353 ms/op spread=3.5% input/copy=65472 B/op median=7625.20 MiB/s checksum=4a729516829cf260
+  line scan all input
+    min=0.059108 median=0.061913 p95=0.062344 max=0.062344 ms/op spread=5.2% input/copy=65472 B/op median=1008.50 MiB/s checksum=7e5d4a37edabd260
+  split runs all lines
+    min=0.297756 median=0.299724 p95=0.305579 max=0.305579 ms/op spread=2.6% input/copy=65472 B/op median=208.32 MiB/s checksum=3551d82d0fa0ea60
+last-24 experiment: scanned=65472 selected/feed=1584 B; NOT runtime semantics
+  split runs selected last-24
+    min=0.007055 median=0.007108 p95=0.007168 max=0.007168 ms/op spread=1.6% input/copy=1584 B/op median=212.54 MiB/s checksum=6f6bb7a1921ef560
+  scan+split all input
+    min=0.356489 median=0.359855 p95=0.366371 max=0.366371 ms/op spread=2.7% input/copy=65472 B/op median=173.51 MiB/s checksum=6d7c781a21795d60
+  scan+split last-24 (scanned B)
+    min=0.065958 median=0.066886 p95=0.068540 max=0.068540 ms/op spread=3.9% input/copy=65472 B/op median=933.51 MiB/s checksum=654f48b8ff29e460
+  VT feed all (reset excluded)
+    min=4.310992 median=4.878340 p95=5.505950 max=5.505950 ms/op spread=24.5% input/copy=65472 B/op median=12.80 MiB/s checksum=e2636f5e5e151b9c
+  VT feed selected last-24
+    min=0.090697 median=0.092999 p95=0.114725 max=0.114725 ms/op spread=25.8% input/copy=1584 B/op median=16.24 MiB/s checksum=40ba54207ddaf958
+  ingest->all VT->render->copy
+    min=10.177309 median=17.715116 p95=19.121037 max=19.121037 ms/op spread=50.5% input/copy=65472 B/op median=3.52 MiB/s checksum=794a7f0e775eee3e
+  pipeline/pass raw=65472 fed=65472 scanned=65472 dropped=0 final-unread=0 max-retained=4093 chunks=16 renders/copies=16
+
+input controls: corpus/raw=65508 B; parse/VT start with all bytes retained, no loss
+  synthetic ring overwrite copy
+    min=0.006510 median=0.006574 p95=0.006584 max=0.006584 ms/op spread=1.1% input/copy=65508 B/op median=9503.09 MiB/s checksum=466ed48ff3ba5ac
+  line scan all input
+    min=0.282502 median=0.285368 p95=0.298678 max=0.298678 ms/op spread=5.7% input/copy=65508 B/op median=218.92 MiB/s checksum=981c9f6618206e8c
+  split runs all lines
+    min=0.778383 median=0.848429 p95=1.032853 max=1.032853 ms/op spread=30.0% input/copy=65508 B/op median=73.63 MiB/s checksum=778955245045530c
+last-24 experiment: scanned=65508 selected/feed=636 B; NOT runtime semantics
+  split runs selected last-24
+    min=0.007408 median=0.007996 p95=0.008552 max=0.008552 ms/op spread=14.3% input/copy=636 B/op median=75.85 MiB/s checksum=c86d0752030a7d6c
+  scan+split all input
+    min=1.085680 median=1.147575 p95=1.197968 max=1.197968 ms/op spread=9.8% input/copy=65508 B/op median=54.44 MiB/s checksum=2b0e8422dd1eb7ec
+  scan+split last-24 (scanned B)
+    min=0.292323 median=0.293671 p95=0.300561 max=0.300561 ms/op spread=2.8% input/copy=65508 B/op median=212.73 MiB/s checksum=52d1a7a93be2d2cc
+  VT feed all (reset excluded)
+    min=3.910664 median=4.745738 p95=4.937991 max=4.937991 ms/op spread=21.6% input/copy=65508 B/op median=13.16 MiB/s checksum=7c36fcdf9147e6f2
+  VT feed selected last-24
+    min=0.029438 median=0.032094 p95=0.036612 max=0.036612 ms/op spread=22.4% input/copy=636 B/op median=18.90 MiB/s checksum=e084f7f477ebb868
+  ingest->all VT->render->copy
+    min=13.809248 median=14.630636 p95=21.011991 max=21.011991 ms/op spread=49.2% input/copy=65508 B/op median=4.27 MiB/s checksum=9ca88aa8ea3f1e74
+  pipeline/pass raw=65508 fed=65508 scanned=65522 dropped=0 final-unread=0 max-retained=4096 chunks=17 renders/copies=17
+
+input mixed-UTF8: corpus/raw=65516 B; parse/VT start with all bytes retained, no loss
+  synthetic ring overwrite copy
+    min=0.005278 median=0.005371 p95=0.007582 max=0.007582 ms/op spread=42.9% input/copy=65516 B/op median=11633.23 MiB/s checksum=ccf029d4e520404a
+  line scan all input
+    min=0.041337 median=0.043152 p95=0.043397 max=0.043397 ms/op spread=4.8% input/copy=65516 B/op median=1447.91 MiB/s checksum=ec688bd78988975a
+  split runs all lines
+    min=0.897660 median=0.968254 p95=1.042033 max=1.042033 ms/op spread=14.9% input/copy=65516 B/op median=64.53 MiB/s checksum=c41de861c74c675a
+last-24 experiment: scanned=65516 selected/feed=1056 B; NOT runtime semantics
+  split runs selected last-24
+    min=0.020463 median=0.021757 p95=0.022796 max=0.022796 ms/op spread=10.7% input/copy=1056 B/op median=46.29 MiB/s checksum=b295609b0f171e8a
+  scan+split all input
+    min=0.947818 median=0.994451 p95=1.152012 max=1.152012 ms/op spread=20.5% input/copy=65516 B/op median=62.83 MiB/s checksum=2f2aab8558c8e10a
+  scan+split last-24 (scanned B)
+    min=0.055561 median=0.057098 p95=0.077181 max=0.077181 ms/op spread=37.9% input/copy=65516 B/op median=1094.28 MiB/s checksum=36ed264f209709ba
+  VT feed all (reset excluded)
+    min=4.012539 median=6.059935 p95=6.333360 max=6.333360 ms/op spread=38.3% input/copy=65516 B/op median=10.31 MiB/s checksum=84490b0251e6ffea
+  VT feed selected last-24
+    min=0.059038 median=0.081084 p95=0.102908 max=0.102908 ms/op spread=54.1% input/copy=1056 B/op median=12.42 MiB/s checksum=2c5de0798919575a
+  ingest->all VT->render->copy
+    min=9.458403 median=9.815886 p95=14.864675 max=14.864675 ms/op spread=55.1% input/copy=65516 B/op median=6.37 MiB/s checksum=7afea1df90fae628
+  pipeline/pass raw=65516 fed=65516 scanned=65526 dropped=0 final-unread=0 max-retained=4095 chunks=17 renders/copies=17
+
+lossy firehose: synthetic memcpy ingestion only; 4 MiB/op, 64 KiB retained, no parse/VT
+  overrun ring ingest
+    min=0.305436 median=0.319548 p95=0.339247 max=0.339247 ms/op spread=10.6% input/copy=4194304 B/op median=12517.70 MiB/s checksum=b637157c50e58ef4
+
+unicode width: queries, NOT bytes
+  cellWidth ASCII
+    min=24.236719 median=24.293750 p95=26.605469 max=26.605469 ns/query spread=9.8% queries=128/op median=41.16 Mquery/s checksum=12ddd69531cfa454
+  cellWidth U+0000..U+2FFF
+    min=23.722192 median=23.815853 p95=23.971289 max=23.971289 ns/query spread=1.0% queries=12288/op median=41.99 Mquery/s checksum=f78d19098f448a8c
+  cellWidth CJK range
+    min=23.769092 median=23.789600 p95=23.812720 max=23.812720 ns/query spread=0.2% queries=4096/op median=42.04 Mquery/s checksum=4109540db35aa12c
+
+render 80x24: framebuffer=800x456 (1459200 B); 10 iterations/batch
+  Warm glyph cache/snapshot; cursor hidden except cursor case. Dirty scenarios mutate before timing; resize includes reflow/alloc/render.
+  Damage is a bounding band, NOT exact painted pixel bytes.
+  full repaint (invalidate)
+    min=0.913886 median=1.002199 p95=1.070919 max=1.070919 ms/frame spread=15.7% checksum=48ead52666a1c718
+    mean damage-band=456.0 pixel-rows/frame fill=0.424 glyph=0.570 ms/frame
+  no-change render
+    min=0.000750 median=0.000775 p95=0.000782 max=0.000782 ms/frame spread=4.1% checksum=57d83432d2cbe9c4
+    mean damage-band=0.0 pixel-rows/frame fill=0.000 glyph=0.000 ms/frame
+  single-cell dirty render
+    min=0.045995 median=0.046444 p95=0.047410 max=0.047410 ms/frame spread=3.0% checksum=c85cec62ee9bfb84
+    mean damage-band=19.0 pixel-rows/frame fill=0.015 glyph=0.031 ms/frame
+  one-line dirty render
+    min=0.055099 median=0.057989 p95=0.071480 max=0.071480 ms/frame spread=28.2% checksum=866f37e6c1b61772
+    mean damage-band=19.0 pixel-rows/frame fill=0.017 glyph=0.042 ms/frame
+  cursor-move render
+    min=0.050394 median=0.051383 p95=0.051626 max=0.051626 ms/frame spread=2.4% checksum=7a0d38b030ed40c6
+    mean damage-band=41.8 pixel-rows/frame fill=0.016 glyph=0.034 ms/frame
+  selection-change render
+    min=0.086194 median=0.088212 p95=0.133083 max=0.133083 ms/frame spread=53.2% checksum=8ca2c3f775eb48a
+    mean damage-band=38.0 pixel-rows/frame fill=0.037 glyph=0.061 ms/frame
+  one-row scroll render
+    min=0.411712 median=0.422697 p95=0.553634 max=0.553634 ms/frame spread=33.6% checksum=8c71d47a70d33ac0
+    mean damage-band=456.0 pixel-rows/frame fill=0.018 glyph=0.007 ms/frame
+  resize +/-1 col + render
+    min=3.689653 median=3.744486 p95=3.804907 max=3.804907 ms/frame spread=3.1% checksum=7b52efe0a5742c0c
+    mean damage-band=456.0 pixel-rows/frame fill=0.389 glyph=0.569 ms/frame
+  CPU framebuffer memcpy
+    min=0.172913 median=0.173832 p95=0.193795 max=0.193795 ms/op spread=12.0% input/copy=1459200 B/op median=8005.46 MiB/s checksum=fd3bf3caca6df378
+  CPU framebuffer memset
+    min=0.349861 median=0.372858 p95=0.441445 max=0.441445 ms/op spread=24.6% input/copy=1459200 B/op median=3732.26 MiB/s checksum=2ff25e601b95b794
+  render-suite checksum=2ff25e601b95b794
+
+fonts: glyph queries (not coverage bandwidth); cache hits peek without refreshing LRU
+  glyph hot ASCII table
+    min=64.233684 median=66.204211 p95=66.403158 max=66.403158 ns/query spread=3.3% queries=95/op median=15.10 Mquery/s checksum=3b5e93f892f2e3e0
+    last batch hits=950 misses=0 (missing codepoints may use replacement glyph)
+  glyph hot non-ASCII cache
+    min=456.806250 median=465.900000 p95=480.156250 max=480.156250 ns/query spread=5.0% queries=16/op median=2.15 Mquery/s checksum=3c991bb0bf9b1c90
+    last batch hits=160 misses=0 (missing codepoints may use replacement glyph)
+  peekGlyph non-ASCII cache
+    min=399.643750 median=446.750000 p95=462.437500 max=462.437500 ns/query spread=14.1% queries=16/op median=2.24 Mquery/s checksum=cf7bf244317516c0
+  clearAtlas INCLUDING ASCII prewarm
+    min=6.606332 median=7.010482 p95=7.263147 max=7.263147 ms/op spread=9.4% checksum=49b649796bef021c
+  rasterize A incl alloc/free
+    min=0.014944 median=0.015317 p95=0.029811 max=0.029811 ms/op spread=97.1% checksum=ae683f1a63f2f8ca
+  atlas pack+blit A
+    min=0.000197 median=0.000211 p95=0.000216 max=0.000216 ms/op spread=9.0% checksum=91dc1edfb73d2318
+
+render 220x60: framebuffer=2200x1140 (10032000 B); 2 iterations/batch
+  Warm glyph cache/snapshot; cursor hidden except cursor case. Dirty scenarios mutate before timing; resize includes reflow/alloc/render.
+  Damage is a bounding band, NOT exact painted pixel bytes.
+  full repaint (invalidate)
+    min=5.754217 median=5.911349 p95=6.384028 max=6.384028 ms/frame spread=10.7% checksum=cef9d5c9286528a6
+    mean damage-band=1140.0 pixel-rows/frame fill=2.520 glyph=3.484 ms/frame
+  no-change render
+    min=0.002030 median=0.002295 p95=0.005783 max=0.005783 ms/frame spread=163.6% checksum=36a0686ce88dcbdc
+    mean damage-band=0.0 pixel-rows/frame fill=0.000 glyph=0.000 ms/frame
+  single-cell dirty render
+    min=0.108192 median=0.108745 p95=0.109552 max=0.109552 ms/frame spread=1.3% checksum=922ef7b930c105aa
+    mean damage-band=19.0 pixel-rows/frame fill=0.036 glyph=0.070 ms/frame
+  one-line dirty render
+    min=0.129652 median=0.130236 p95=0.136637 max=0.136637 ms/frame spread=5.4% checksum=a6b7a0f0a267e330
+    mean damage-band=19.0 pixel-rows/frame fill=0.036 glyph=0.094 ms/frame
+  cursor-move render
+    min=0.157044 median=0.169057 p95=0.299779 max=0.299779 ms/frame spread=84.4% checksum=5d493f0648ecb1b6
+    mean damage-band=304.0 pixel-rows/frame fill=0.070 glyph=0.129 ms/frame
+  selection-change render
+    min=0.202213 median=0.203521 p95=0.370359 max=0.370359 ms/frame spread=82.6% checksum=e7f6d3594e2f3cc6
+    mean damage-band=38.0 pixel-rows/frame fill=0.087 glyph=0.146 ms/frame
+  one-row scroll render
+    min=2.945262 median=3.029916 p95=3.785384 max=3.785384 ms/frame spread=27.7% checksum=2d67cd33f8be3efc
+    mean damage-band=1140.0 pixel-rows/frame fill=0.046 glyph=0.021 ms/frame
+  resize +/-1 col + render
+    min=18.462982 median=19.576288 p95=22.020551 max=22.020551 ms/frame spread=18.2% checksum=f35651811f59452
+    mean damage-band=1140.0 pixel-rows/frame fill=2.727 glyph=4.189 ms/frame
+  CPU framebuffer memcpy
+    min=2.218582 median=2.313972 p95=3.519776 max=3.519776 ms/op spread=56.2% input/copy=10032000 B/op median=4134.56 MiB/s checksum=7d2d79dd01b8998
+  CPU framebuffer memset
+    min=3.292553 median=4.226264 p95=4.774601 max=4.774601 ms/op spread=35.1% input/copy=10032000 B/op median=2263.76 MiB/s checksum=17e6b9d6461f1750
+  render-suite checksum=17e6b9d6461f1750
+
+render 384x113: framebuffer=3840x2147 (32977920 B); 2 iterations/batch
+  Warm glyph cache/snapshot; cursor hidden except cursor case. Dirty scenarios mutate before timing; resize includes reflow/alloc/render.
+  Damage is a bounding band, NOT exact painted pixel bytes.
+  full repaint (invalidate)
+    min=30.711851 median=31.533142 p95=34.749662 max=34.749662 ms/frame spread=12.8% checksum=3239f2fb1e63f2dc
+    mean damage-band=2147.0 pixel-rows/frame fill=13.467 glyph=18.530 ms/frame
+  no-change render
+    min=0.004472 median=0.005428 p95=0.007760 max=0.007760 ms/frame spread=60.6% checksum=da051382ecbab3f8
+    mean damage-band=0.0 pixel-rows/frame fill=0.000 glyph=0.000 ms/frame
+  single-cell dirty render
+    min=0.242801 median=0.244858 p95=0.271917 max=0.271917 ms/frame spread=11.9% checksum=d42889eaa5b7acde
+    mean damage-band=19.0 pixel-rows/frame fill=0.084 glyph=0.159 ms/frame
+  one-line dirty render
+    min=0.266107 median=0.272387 p95=0.323113 max=0.323113 ms/frame spread=20.9% checksum=d9dea4aa6cb50e4c
+    mean damage-band=19.0 pixel-rows/frame fill=0.079 glyph=0.199 ms/frame
+  cursor-move render
+    min=0.331365 median=0.458266 p95=0.625958 max=0.625958 ms/frame spread=64.3% checksum=1586afdbbbfb07da
+    mean damage-band=551.0 pixel-rows/frame fill=0.169 glyph=0.300 ms/frame
+  selection-change render
+    min=0.514205 median=0.594687 p95=0.839308 max=0.839308 ms/frame spread=54.7% checksum=76a6049f3c090c6a
+    mean damage-band=38.0 pixel-rows/frame fill=0.239 glyph=0.407 ms/frame
+  one-row scroll render
+    min=14.557757 median=17.124849 p95=19.602253 max=19.602253 ms/frame spread=29.5% checksum=dbf52f5f7f3e2f50
+    mean damage-band=2147.0 pixel-rows/frame fill=0.139 glyph=0.053 ms/frame
+  resize +/-1 col + render
+    min=67.198285 median=73.080763 p95=78.207060 max=78.207060 ms/frame spread=15.1% checksum=de1c9d03ae8b87ec
+    mean damage-band=2147.0 pixel-rows/frame fill=10.901 glyph=16.304 ms/frame
+  CPU framebuffer memcpy
+    min=7.789158 median=8.338625 p95=10.155955 max=10.155955 ms/op spread=28.4% input/copy=32977920 B/op median=3771.63 MiB/s checksum=4151b5fc6473cec8
+  CPU framebuffer memset
+    min=8.243096 median=8.834747 p95=9.677201 max=9.677201 ms/op spread=16.2% input/copy=32977920 B/op median=3559.83 MiB/s checksum=ad20ec579fc638f4
+  render-suite checksum=ad20ec579fc638f4
+
+checksum 91dc1edfb73d2318 (observable state/pixels; not a portable golden)
+saved bench/2026-10-09T080506Z-6b99d91ca227-dirty.txt and last_bench

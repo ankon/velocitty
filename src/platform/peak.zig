@@ -1,4 +1,4 @@
-//! Calls into `godstack/Peak/peak.h` that the terminal uses.
+//! Calls into the vendored `vendor/godstack/Peak/peak.h` that the terminal uses.
 //! Struct layouts match that header. Linux only.
 
 const std = @import("std");

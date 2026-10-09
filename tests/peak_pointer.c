@@ -1,7 +1,7 @@
 /* Headless regression tests for Peak's Wayland click routing.
- * cc -Igodstack/Peak tests/peak_pointer.c -o /tmp/peak-pointer -ldl -lpthread -lm
+ * cc -Ivendor/godstack/Peak tests/peak_pointer.c -o /tmp/peak-pointer -ldl -lpthread -lm
  */
-#include "../godstack/Peak/peak.c"
+#include "../vendor/godstack/Peak/peak.c"
 #include <assert.h>
 
 static int geometry, input, destroyed;

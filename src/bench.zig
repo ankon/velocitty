@@ -1,807 +1,698 @@
-//! Stage timings: IO → lines → runs → VT → draw fill → glyph LRU. `zig build bench`
-
+//! Headless, synthetic CPU benchmarks. No window, PTY drain, or compositor latency.
+//! `zig build bench -- --quick`; see --help for sampling controls.
 const std = @import("std");
+const builtin = @import("builtin");
 const CircBuffer = @import("circbuffer.zig").CircBuffer;
-const Line = @import("circbuffer.zig").Line;
 const VtState = @import("vt.zig").VtState;
 const Draw = @import("draw.zig");
 const Type = @import("type.zig");
+const Select = @import("select.zig");
 const EastAsian = @import("type/eastasian.zig");
 
-const ring_cap: usize = 64 * 1024;
-const firehose_bytes: usize = 256 * 1024 * 1024;
-const cols: u16 = 80;
-const rows: u16 = 24;
-const hz: u32 = 60;
+const ring_cap = 64 * 1024;
 const size_px: f32 = 16;
-const parse_iters: u32 = 1000;
-const refresh_iters: u32 = 60;
-const micro_iters: u32 = 200;
-const line_w: usize = 81; // 80 printable + '\n'
-
 const font_paths = [_][]const u8{
     "/usr/share/fonts/iosevka-term/IosevkaTermNerdFontMono-Regular.ttf",
     "/usr/share/fonts/iosevka-term/IosevkaTermNerdFont-Regular.ttf",
     "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+};
+const lru_cps = [_]u21{ 0xA9, 0xAE, 0xB0, 0xB1, 0xD7, 0xF7, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x20AC, 0x2190, 0x2191, 0x2192 };
+
+const Options = struct {
+    quick: bool = false,
+    samples: u32 = 5,
+    warmup: u32 = 1,
+    iterations: u32 = 10,
+    font: ?[]const u8 = null,
+    help: bool = false,
 };
 
-var log_buf: std.Io.Writer.Allocating = undefined;
+const usage =
+    \\Usage: zig build bench -- [--quick] [--samples N] [--warmup N]
+    \\                         [--iterations N] [--font PATH] [--help]
+    \\  samples: measured batches (1..100; default 5)
+    \\  warmup:  discarded batches (0..100; default 1)
+    \\  iterations: operations per batch (1..10000; default 10)
+    \\  quick: defaults to 3 samples, 1 warmup, 2 iterations; large frames use
+    \\         one iteration per batch (normal: ceil(iterations / 5)).
+    \\  Explicit counts override quick defaults, regardless of argument order.
+    \\  Both --name=value and --name value are accepted. Unknown/duplicate
+    \\  options and malformed values fail. Explicit font errors are fatal.
+    \\  Without a font, CPU parsing/VT and placeholder rendering still run;
+    \\  glyph/raster/atlas benchmarks are explicitly skipped.
+    \\  Logs: bench/<UTC>-<git12>[-dirty].txt and last_bench in the current dir.
+    \\  Metrics are sample-batch averages, not individual-frame latency tails.
+    \\  These are headless CPU costs, not PTY/compositor/input latency or FPS.
+    \\
+;
 
-fn out(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print(fmt, args);
-    log_buf.writer.print(fmt, args) catch {};
-}
-
-pub fn main() !void {
-    const gpa = std.heap.page_allocator;
-    std.debug.print("bench: start\n", .{});
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    std.debug.print("bench: io\n", .{});
-
-    log_buf = .init(gpa);
-    defer log_buf.deinit();
-
-    const stamp = utcStamp(io);
-    std.debug.print("bench: stamp\n", .{});
-    const git = try gitRev(gpa, io);
-    defer gpa.free(git.hash);
-    std.debug.print("bench: git\n", .{});
-
-    var buf = try CircBuffer.create(gpa, ring_cap);
-    defer buf.destroy();
-    std.debug.print("bench: circ\n", .{});
-
-    var term = try VtState.init(gpa, cols, rows, 1000, buf.storage);
-    defer term.deinit();
-    std.debug.print("bench: vt\n", .{});
-
-    const payload = try makePayload(gpa, ring_cap, cols);
-    defer gpa.free(payload);
-    std.debug.print("bench: payload\n", .{});
-
-    ingest(&buf, payload);
-    std.debug.print("bench: ingest\n", .{});
-
-    out("utc  {s}\n", .{stamp.iso});
-    out("git  {s}{s}\n", .{ git.hash, if (git.dirty) " dirty" else "" });
-    out(
-        "velocitty pipeline bench  ring {d} KiB  screen {d}x{d}  mapped={s}  firehose {d} MiB\n",
-        .{
-            ring_cap / 1024,
-            cols,
-            rows,
-            if (buf.mapped) "yes" else "heap",
-            firehose_bytes / (1024 * 1024),
-        },
-    );
-    out("  16.67 ms = {d} Hz budget\n\n", .{hz});
-
-    try benchIo(&buf, payload);
-    try benchParse(&buf, payload);
-    try benchVt(&buf, &term, payload);
-    try benchUnicode(gpa);
-
-    const font_bytes = loadFont(io, gpa) catch null;
-    defer if (font_bytes) |b| gpa.free(b);
-
-    var type_ctx: ?Type.Context = null;
-    defer if (type_ctx) |*ctx| ctx.deinit();
-    var cell_w: u32 = 8;
-    var cell_h: u32 = 16;
-    if (font_bytes) |bytes| {
-        var ctx = try Type.Context.init(gpa, .{});
-        _ = try ctx.addFont(bytes, .{});
-        if (ctx.metrics(size_px)) |m| {
-            const h = m.ascender - m.descender + m.line_gap;
-            cell_h = @max(1, @as(u32, @intFromFloat(@ceil(h))));
-        } else |_| {}
-        if (ctx.glyph('M', size_px)) |g| {
-            cell_w = @max(1, @as(u32, @intFromFloat(@ceil(g.advance))));
-        } else |_| {}
-        ctx.stats = .{};
-        type_ctx = ctx;
-    } else {
-        out("font  (none found; draw/glyph LRU skipped)\n\n", .{});
-    }
-
-    if (type_ctx) |*ctx| {
-        var frame = try Draw.Frame.init(gpa, @as(u32, cols) * cell_w, @as(u32, rows) * cell_h);
-        defer frame.deinit();
-        fillAsciiScreen(&term);
-        const px = frame.width * frame.height;
-        out(
-            "draw  cell {d}x{d}  fb {d}x{d} ({d} px, {d} KiB)  {d} cells\n",
-            .{
-                cell_w,
-                cell_h,
-                frame.width,
-                frame.height,
-                px,
-                px * 4 / 1024,
-                occupiedCells(&term),
-            },
-        );
-        try benchDraw(&frame, &term, ctx, cell_w, cell_h);
-        try benchGlyphs(ctx, &term);
-        try benchRasterAtlas(gpa, ctx);
-        try benchPresentCopy(&frame);
-        try benchLarge(gpa, ctx, cell_w, cell_h);
-    }
-
-    saveLog(io, stamp.file, git.hash, git.dirty);
-}
-
-fn benchIo(buf: *CircBuffer, payload: []const u8) !void {
-    out("IO  (circbuffer ingest, truncates to ring)\n", .{});
-    var chunk: [ring_cap]u8 = undefined;
-    fillLines(&chunk);
-
-    var scratch = try CircBuffer.create(std.heap.page_allocator, ring_cap);
-    defer scratch.destroy();
-
-    var t0 = nowNs();
-    var off: usize = 0;
-    while (off < firehose_bytes) {
-        ingest(&scratch, &chunk);
-        off += chunk.len;
-    }
-    row("firehose into ring", nowNs() - t0, firehose_bytes);
-    out("  retained {d} B  (cap {d}; truncated={s})\n", .{
-        retainedBytes(&scratch),
-        ring_cap,
-        if (retainedBytes(&scratch) <= ring_cap) "yes" else "NO",
-    });
-
-    t0 = nowNs();
-    var i: u32 = 0;
-    while (i < parse_iters) : (i += 1) {
-        ingest(&scratch, payload);
-    }
-    row("ring fill payload x1000", nowNs() - t0, @as(usize, parse_iters) * payload.len);
-    out("\n", .{});
-
-    // Restore the shared ring for later stages.
-    rewindPending(buf);
-    ingest(buf, payload);
-}
-
-fn benchParse(buf: *CircBuffer, payload: []const u8) !void {
-    out("parse  ({d} iters on {d} B ring)\n", .{ parse_iters, payload.len });
-
-    var line_ns: i128 = 0;
-    var run_ns: i128 = 0;
-    var last_run_bytes: usize = 0;
-    var i: u32 = 0;
-    while (i < parse_iters) : (i += 1) {
-        rewindPending(buf);
-        var t = nowNs();
-        buf.consumeAndPreparse();
-        line_ns += nowNs() - t;
-        const lines = buf.getLastNLines(rows);
-        t = nowNs();
-        buf.splitIntoRuns(lines);
-        run_ns += nowNs() - t;
-        last_run_bytes = runBytes(buf);
-        std.mem.doNotOptimizeAway(buf.runs.items.len);
-    }
-    // Line split always scans the pending ring; last-N only shrinks run split.
-    row("lines last 24 (scan ring)", line_ns, ring_cap * parse_iters);
-    row("runs last 24 (DESIGN)", run_ns, last_run_bytes * parse_iters);
-
-    line_ns = 0;
-    run_ns = 0;
-    var all_line_bytes: usize = 0;
-    var all_run_bytes: usize = 0;
-    i = 0;
-    while (i < parse_iters) : (i += 1) {
-        rewindPending(buf);
-        var t = nowNs();
-        buf.consumeAndPreparse();
-        line_ns += nowNs() - t;
-        all_line_bytes = lineBytes(buf.lines.items);
-        t = nowNs();
-        buf.splitIntoRuns(buf.lines.items);
-        run_ns += nowNs() - t;
-        all_run_bytes = runBytes(buf);
-        std.mem.doNotOptimizeAway(buf.runs.items.len);
-    }
-    row("lines all ring", line_ns, all_line_bytes * parse_iters);
-    row("runs all ring", run_ns, all_run_bytes * parse_iters);
-
-    var combined_ns: i128 = 0;
-    i = 0;
-    while (i < parse_iters) : (i += 1) {
-        rewindPending(buf);
-        const t = nowNs();
-        _ = buf.consumeAndGetRuns(rows);
-        combined_ns += nowNs() - t;
-    }
-    row("lines+runs last 24", combined_ns, last_run_bytes * parse_iters);
-
-    combined_ns = 0;
-    i = 0;
-    while (i < parse_iters) : (i += 1) {
-        rewindPending(buf);
-        const t = nowNs();
-        _ = buf.consumeAndGetRuns(std.math.maxInt(usize));
-        combined_ns += nowNs() - t;
-    }
-    row("lines+runs all ring", combined_ns, all_run_bytes * parse_iters);
-    out("\n", .{});
-}
-
-fn benchVt(buf: *CircBuffer, term: *VtState, payload: []const u8) !void {
-    out("vt  (feedRuns / state update, {d} iters)\n", .{ parse_iters });
-
-    rewindPending(buf);
-    ingest(buf, payload);
-
-    var last_bytes: usize = 0;
-    var ns: i128 = 0;
-    var i: u32 = 0;
-    while (i < parse_iters) : (i += 1) {
-        rewindPending(buf);
-        const runs = buf.consumeAndGetRuns(rows);
-        last_bytes = runBytes(buf);
-        term.reset();
-        const t = nowNs();
-        if (runs.len != 0) term.feedRuns(runs);
-        ns += nowNs() - t;
-    }
-    row("feedRuns last 24", ns, last_bytes * parse_iters);
-
-    var all_bytes: usize = 0;
-    ns = 0;
-    i = 0;
-    while (i < parse_iters) : (i += 1) {
-        rewindPending(buf);
-        const runs = buf.consumeAndGetRuns(std.math.maxInt(usize));
-        all_bytes = runBytes(buf);
-        term.reset();
-        const t = nowNs();
-        if (runs.len != 0) term.feedRuns(runs);
-        ns += nowNs() - t;
-    }
-    row("feedRuns all ring", ns, all_bytes * parse_iters);
-
-    ns = 0;
-    i = 0;
-    while (i < parse_iters) : (i += 1) {
-        rewindPending(buf);
-        term.reset();
-        const t = nowNs();
-        const runs = buf.consumeAndGetRuns(rows);
-        if (runs.len != 0) term.feedRuns(runs);
-        ns += nowNs() - t;
-    }
-    row("pipeline last 24", ns, last_bytes * parse_iters);
-
-    ns = 0;
-    i = 0;
-    while (i < parse_iters) : (i += 1) {
-        rewindPending(buf);
-        term.reset();
-        const t = nowNs();
-        const runs = buf.consumeAndGetRuns(std.math.maxInt(usize));
-        if (runs.len != 0) term.feedRuns(runs);
-        ns += nowNs() - t;
-    }
-    row("pipeline all ring", ns, all_bytes * parse_iters);
-    out("\n", .{});
-}
-
-fn benchUnicode(gpa: std.mem.Allocator) !void {
-    out("unicode  (width tables / utf8 runs+term, {d} iters)\n", .{micro_iters});
-    var acc: u64 = 0;
-    var t = nowNs();
-    var n: u32 = 0;
-    while (n < micro_iters) : (n += 1) {
-        var cp: u21 = 0;
-        while (cp < 0x80) : (cp += 1) acc += EastAsian.cellWidth(cp);
-    }
-    row("cellWidth ASCII x200", nowNs() - t, @as(usize, micro_iters) * 0x80);
-
-    t = nowNs();
-    n = 0;
-    while (n < micro_iters) : (n += 1) {
-        var cp: u21 = 0;
-        while (cp < 0x3000) : (cp += 1) acc += EastAsian.cellWidth(cp);
-    }
-    row("cellWidth 0..U+2FFF x200", nowNs() - t, @as(usize, micro_iters) * 0x3000);
-
-    t = nowNs();
-    n = 0;
-    while (n < micro_iters) : (n += 1) {
-        var cp: u21 = 0x4E00;
-        while (cp < 0x4E00 + 4096) : (cp += 1) acc += EastAsian.cellWidth(cp);
-    }
-    row("cellWidth CJK U+4E00 x200", nowNs() - t, @as(usize, micro_iters) * 4096);
-    std.mem.doNotOptimizeAway(acc);
-
-    const cjk = try makeCjkPayload(gpa, ring_cap, cols);
-    defer gpa.free(cjk);
-    var cjk_buf = try CircBuffer.create(gpa, ring_cap);
-    defer cjk_buf.destroy();
-    var screen = try VtState.init(gpa, cols, rows, 1000, cjk_buf.storage);
-    defer screen.deinit();
-    ingest(&cjk_buf, cjk);
-
-    var pre_ns: i128 = 0;
-    var runs_ns: i128 = 0;
-    var term_ns: i128 = 0;
-    var bytes: usize = 0;
-    var i: u32 = 0;
-    while (i < refresh_iters) : (i += 1) {
-        rewindPending(&cjk_buf);
-        var tt = nowNs();
-        cjk_buf.consumeAndPreparse();
-        pre_ns += nowNs() - tt;
-        tt = nowNs();
-        cjk_buf.splitIntoRuns(cjk_buf.lines.items);
-        runs_ns += nowNs() - tt;
-        bytes = runBytes(&cjk_buf);
-        screen.reset();
-        tt = nowNs();
-        if (cjk_buf.runs.items.len != 0) screen.feedRuns(cjk_buf.runs.items);
-        term_ns += nowNs() - tt;
-    }
-    row("preparse CJK utf8", pre_ns, bytes * refresh_iters);
-    row("runs.split CJK utf8", runs_ns, bytes * refresh_iters);
-    row("term.feedRuns CJK", term_ns, bytes * refresh_iters);
-    out("\n", .{});
-}
-
-fn benchDraw(frame: *Draw.Frame, term: *VtState, type_ctx: *Type.Context, cell_w: u32, cell_h: u32) !void {
-    const fb_bytes = frame.pixels.len * @sizeOf(u32);
-
-    type_ctx.clearAtlas();
-    type_ctx.stats = .{};
-    frame.invalidate();
-    term.markDirtyAll();
-    const t_cold = nowNs();
-    frame.render(term, cell_w, cell_h, type_ctx, size_px);
-    const cold_ns = nowNs() - t_cold;
-    const cold_stats = type_ctx.stats;
-    row("render COLD", cold_ns, fb_bytes);
-    out(
-        "    fill {d:.3} ms   glyphs {d:.3} ms   raster {d:.3} ms   atlas {d:.3} ms   miss {d} hit {d}\n",
-        .{
-            nsMs(frame.last_fill_ns),
-            nsMs(frame.last_glyph_ns),
-            nsMs(cold_stats.raster_ns),
-            nsMs(cold_stats.atlas_ns),
-            cold_stats.misses,
-            cold_stats.hits,
-        },
-    );
-
-    type_ctx.stats = .{};
-    var fill_ns: u64 = 0;
-    var glyph_ns: u64 = 0;
-    term.clearDirty();
-    const t_hot = nowNs();
-    var i: u32 = 0;
-    while (i < refresh_iters) : (i += 1) {
-        frame.render(term, cell_w, cell_h, type_ctx, size_px);
-        fill_ns += frame.last_fill_ns;
-        glyph_ns += frame.last_glyph_ns;
-    }
-    row("render HOT skip x60", nowNs() - t_hot, fb_bytes * refresh_iters);
-    out(
-        "    fill {d:.3} ms ({d:.3} ms/f)   glyphs {d:.3} ms ({d:.3} ms/f)   raster {d:.3} ms   atlas {d:.3} ms   miss {d} hit {d}\n",
-        .{
-            nsMs(fill_ns),
-            nsMs(fill_ns) / @as(f64, refresh_iters),
-            nsMs(glyph_ns),
-            nsMs(glyph_ns) / @as(f64, refresh_iters),
-            nsMs(type_ctx.stats.raster_ns),
-            nsMs(type_ctx.stats.atlas_ns),
-            type_ctx.stats.misses,
-            type_ctx.stats.hits,
-        },
-    );
-
-    fill_ns = 0;
-    glyph_ns = 0;
-    i = 0;
-    const t_full = nowNs();
-    while (i < refresh_iters) : (i += 1) {
-        frame.invalidate();
-        term.markDirtyAll();
-        frame.render(term, cell_w, cell_h, type_ctx, size_px);
-        fill_ns += frame.last_fill_ns;
-        glyph_ns += frame.last_glyph_ns;
-    }
-    rowFrame("draw.render FULL x60", nowNs() - t_full, refresh_iters, fb_bytes);
-    out(
-        "    fillRect {d:.3} ms ({d:.3} ms/f)   blit+lookup {d:.3} ms ({d:.3} ms/f)\n",
-        .{
-            nsMs(fill_ns),
-            nsMs(fill_ns) / @as(f64, refresh_iters),
-            nsMs(glyph_ns),
-            nsMs(glyph_ns) / @as(f64, refresh_iters),
-        },
-    );
-
-    frame.render(term, cell_w, cell_h, type_ctx, size_px);
-    term.clearDirty();
-    fill_ns = 0;
-    glyph_ns = 0;
-    i = 0;
-    const t_skip = nowNs();
-    while (i < refresh_iters) : (i += 1) {
-        frame.render(term, cell_w, cell_h, type_ctx, size_px);
-        fill_ns += frame.last_fill_ns;
-        glyph_ns += frame.last_glyph_ns;
-    }
-    rowFrame("draw.render skip x60", nowNs() - t_skip, refresh_iters, fb_bytes);
-    out(
-        "    fillRect {d:.3} ms ({d:.3} ms/f)   blit+lookup {d:.3} ms ({d:.3} ms/f)\n",
-        .{
-            nsMs(fill_ns),
-            nsMs(fill_ns) / @as(f64, refresh_iters),
-            nsMs(glyph_ns),
-            nsMs(glyph_ns) / @as(f64, refresh_iters),
-        },
-    );
-
-    const t_memset = nowNs();
-    i = 0;
-    while (i < refresh_iters) : (i += 1) {
-        @memset(frame.pixels, 0);
-    }
-    rowFrame("fb memset x60", nowNs() - t_memset, refresh_iters, fb_bytes);
-    out("\n", .{});
-}
-
-fn benchGlyphs(type_ctx: *Type.Context, term: *VtState) !void {
-    out("glyphs / LRU  (hot screen {d} cells)\n", .{@as(u32, cols) * rows});
-
-    type_ctx.stats = .{};
-    const t_lookup = nowNs();
-    var r: u16 = 0;
-    var lookups: usize = 0;
-    var cover_bytes: usize = 0;
-    while (r < term.rows) : (r += 1) {
-        var c: u16 = 0;
-        while (c < term.cols) : (c += 1) {
-            const cp = term.cell(r, c).codepoint;
-            if (cp == ' ' or cp == 0) continue;
-            const g = type_ctx.glyph(cp, size_px) catch continue;
-            lookups += 1;
-            cover_bytes += @as(usize, g.width) * g.height;
+fn parseOptions(args: []const [*:0]const u8) !Options {
+    var opt: Options = .{};
+    var seen: u8 = 0;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = std.mem.span(args[i]);
+        const eq = std.mem.indexOfScalar(u8, arg, '=');
+        const name = arg[0 .. eq orelse arg.len];
+        const bit: u8 = if (std.mem.eql(u8, name, "--quick")) 1 else if (std.mem.eql(u8, name, "--samples")) 2 else if (std.mem.eql(u8, name, "--warmup")) 4 else if (std.mem.eql(u8, name, "--iterations")) 8 else if (std.mem.eql(u8, name, "--font")) 16 else if (std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h")) 32 else return error.UnknownOption;
+        if (seen & bit != 0) return error.DuplicateOption;
+        seen |= bit;
+        if (bit == 1 or bit == 32) {
+            if (eq != null) return error.UnexpectedValue;
+            if (bit == 1) opt.quick = true else opt.help = true;
+            continue;
         }
-    }
-    row("type.glyph HOT lookups", nowNs() - t_lookup, cover_bytes);
-    out("    hits {d} misses {d}  lookups {d}\n", .{
-        type_ctx.stats.hits,
-        type_ctx.stats.misses,
-        lookups,
-    });
-    if (lookups == 0) out("    INVALID empty screen\n", .{});
-    out("\n", .{});
-}
-
-fn benchRasterAtlas(gpa: std.mem.Allocator, type_ctx: *Type.Context) !void {
-    out("rasterize / atlas / LRU  (isolated)\n", .{});
-    const face = type_ctx.faces.items[0];
-    const font = face.font;
-
-    type_ctx.clearAtlas();
-    type_ctx.ascii_size = 0;
-    type_ctx.ascii = @splat(null);
-    type_ctx.replacement = null;
-    type_ctx.stats = .{};
-    var cover: usize = 0;
-    const t_miss = nowNs();
-    var cp: u21 = 32;
-    while (cp < 127) : (cp += 1) {
-        const g = try type_ctx.glyph(cp, size_px);
-        cover += @as(usize, g.width) * g.height;
-    }
-    row("glyph() COLD 95 ascii", nowNs() - t_miss, cover);
-    out(
-        "    raster {d:.3} ms   atlas+metrics {d:.3} ms   miss {d} hit {d}\n",
-        .{
-            nsMs(type_ctx.stats.raster_ns),
-            nsMs(type_ctx.stats.atlas_ns),
-            type_ctx.stats.misses,
-            type_ctx.stats.hits,
-        },
-    );
-
-    type_ctx.stats = .{};
-    cover = 0;
-    const t_hit = nowNs();
-    var n: u32 = 0;
-    while (n < micro_iters) : (n += 1) {
-        cp = 32;
-        while (cp < 127) : (cp += 1) {
-            const g = try type_ctx.glyph(cp, size_px);
-            cover += @as(usize, g.width) * g.height;
-        }
-    }
-    row("glyph() HOT 95 ascii x200", nowNs() - t_hit, cover);
-    out("    hits {d} misses {d}  (ascii table, not LRU)\n", .{
-        type_ctx.stats.hits,
-        type_ctx.stats.misses,
-    });
-
-    // Non-ASCII goes through the LRU. U+00A9 COPYRIGHT SIGN is in most Latin fonts.
-    type_ctx.clearAtlas();
-    type_ctx.stats = .{};
-    const lru_cps = [_]u21{ 0x00A9, 0x00AE, 0x00B0, 0x00B1, 0x00D7, 0x00F7, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x20AC, 0x2190, 0x2191, 0x2192 };
-    cover = 0;
-    const t_lru_miss = nowNs();
-    for (lru_cps) |c| {
-        const g = type_ctx.glyph(c, size_px) catch continue;
-        cover += @as(usize, g.width) * g.height;
-    }
-    row("glyph() COLD LRU latin-1", nowNs() - t_lru_miss, cover);
-    out(
-        "    raster {d:.3} ms   atlas {d:.3} ms   miss {d} hit {d}\n",
-        .{
-            nsMs(type_ctx.stats.raster_ns),
-            nsMs(type_ctx.stats.atlas_ns),
-            type_ctx.stats.misses,
-            type_ctx.stats.hits,
-        },
-    );
-
-    type_ctx.stats = .{};
-    cover = 0;
-    const t_lru_hit = nowNs();
-    n = 0;
-    while (n < micro_iters) : (n += 1) {
-        for (lru_cps) |c| {
-            const g = type_ctx.glyph(c, size_px) catch continue;
-            cover += @as(usize, g.width) * g.height;
-        }
-    }
-    row("glyph() HOT LRU x200", nowNs() - t_lru_hit, cover);
-    out("    hits {d} misses {d}\n", .{ type_ctx.stats.hits, type_ctx.stats.misses });
-
-    type_ctx.stats = .{};
-    cover = 0;
-    const t_peek = nowNs();
-    n = 0;
-    while (n < micro_iters) : (n += 1) {
-        for (lru_cps) |c| {
-            if (type_ctx.peekGlyph(c, size_px)) |g| {
-                cover += @as(usize, g.width) * g.height;
+        const value: []const u8 = if (eq) |at| arg[at + 1 ..] else blk: {
+            i += 1;
+            if (i == args.len) return error.MissingValue;
+            break :blk std.mem.span(args[i]);
+        };
+        if (value.len == 0) return error.MissingValue;
+        if (bit == 16) {
+            if (std.mem.startsWith(u8, value, "--")) return error.MissingValue;
+            opt.font = value;
+        } else {
+            for (value) |c| if (c < '0' or c > '9') return error.InvalidCount;
+            const n = std.fmt.parseInt(u32, value, 10) catch return error.InvalidCount;
+            const max: u32 = if (bit == 8) 10000 else 100;
+            if (n > max or (n == 0 and bit != 4)) return error.InvalidCount;
+            switch (bit) {
+                2 => opt.samples = n,
+                4 => opt.warmup = n,
+                8 => opt.iterations = n,
+                else => unreachable,
             }
         }
     }
-    row("peekGlyph HOT LRU x200", nowNs() - t_peek, cover);
-
-    const gid = (try font.glyphIndex('A')) orelse 0;
-    var ras_bytes: usize = 0;
-    const t_ras = nowNs();
-    n = 0;
-    while (n < micro_iters) : (n += 1) {
-        const bmp = try font.rasterize(gpa, gid, size_px);
-        ras_bytes += bmp.pixels.len;
-        gpa.free(bmp.pixels);
+    if (opt.quick) {
+        if (seen & 2 == 0) opt.samples = 3;
+        if (seen & 8 == 0) opt.iterations = 2;
     }
-    row("truetype.rasterize A x200", nowNs() - t_ras, ras_bytes);
-
-    const bmp = try font.rasterize(gpa, gid, size_px);
-    defer gpa.free(bmp.pixels);
-    var atlas = try Type.Atlas.init(gpa, 1024, 1024);
-    defer atlas.deinit();
-    var packed_n: u32 = 0;
-    var packed_bytes: usize = 0;
-    const t_at = nowNs();
-    n = 0;
-    while (n < micro_iters) : (n += 1) {
-        const rect = atlas.pack(bmp.width, bmp.height) orelse blk: {
-            atlas.clear();
-            break :blk atlas.pack(bmp.width, bmp.height) orelse continue;
-        };
-        atlas.blit(rect, bmp.pixels);
-        packed_n += 1;
-        packed_bytes += bmp.pixels.len;
-    }
-    row("atlas.pack+blit x200", nowNs() - t_at, packed_bytes);
-    out("    packed {d}\n\n", .{packed_n});
+    return opt;
 }
 
-fn benchPresentCopy(frame: *Draw.Frame) !void {
-    out("present-shaped memcpy  (no X11)\n", .{});
-    const bytes = frame.pixels.len * @sizeOf(u32);
-    const tmp = try frame.allocator.alloc(u32, frame.pixels.len);
-    defer frame.allocator.free(tmp);
-    var i: u32 = 0;
-    const t0 = nowNs();
-    while (i < refresh_iters) : (i += 1) {
-        @memcpy(tmp, frame.pixels);
+const Log = struct {
+    buffer: std.Io.Writer.Allocating,
+    fn print(self: *Log, comptime fmt: []const u8, args: anytype) !void {
+        std.debug.print(fmt, args);
+        try self.buffer.writer.print(fmt, args);
     }
-    rowFrame("fb memcpy x60", nowNs() - t0, refresh_iters, bytes);
-    out("    fb {d} B\n\n", .{bytes});
-}
+};
 
-fn benchLarge(gpa: std.mem.Allocator, type_ctx: *Type.Context, cell_w: u32, cell_h: u32) !void {
+pub fn main(init: std.process.Init.Minimal) !void {
+    const opt = parseOptions(init.args.vector) catch |err| {
+        std.debug.print("bench: invalid arguments: {s}\n{s}", .{ @errorName(err), usage });
+        return err;
+    };
+    if (opt.help) {
+        std.debug.print("{s}", .{usage});
+        return;
+    }
+    const allocator = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = init.environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var log: Log = .{ .buffer = .init(allocator) };
+    defer log.buffer.deinit();
+    const stamp = try utcStamp(io);
+    const git = try gitRev(allocator, io);
+    defer allocator.free(git.hash);
+    try log.print("velocitty headless CPU benchmark v2\nutc {s}\ngit {s} status={s}\n", .{ stamp.iso, git.hash, git.status });
+    try log.print("compiler Zig {s} optimize={s} target={s}-{s}-{s} cpu-target={s}\n", .{
+        builtin.zig_version_string, @tagName(builtin.mode), @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), @tagName(builtin.abi), builtin.cpu.model.name,
+    });
+    try machineInfo(&log, allocator, io);
+    try log.print("settings quick={} samples={d} warmup={d} iterations={d} ring={d} size_px={d} workload=deterministic-v2 (no random seed)\n", .{
+        opt.quick, opt.samples, opt.warmup, opt.iterations, ring_cap, size_px,
+    });
+    try log.print("clock=monotonic awake; min/median/p95/max and spread=(max-min)/median are batch-average ns/op.\nSetup/reset/checksums excluded; timing, memory barriers and loop bookkeeping included.\nNo PTY/readPTY, Peak, scheduling, GPU/compositor, or input-to-echo measured.\nByte rates describe the named input/copy domain, never painted bytes for skip/dirty frames.\n\n", .{});
+
+    const font = try loadFont(io, allocator, opt.font);
+    defer if (font) |f| allocator.free(f.bytes);
+    var ctx: ?Type.Context = null;
+    defer if (ctx) |*c| c.deinit();
+    var cell_w: u32 = 8;
+    var cell_h: u32 = 16;
+    if (font) |f| {
+        ctx = try Type.Context.init(allocator, .{});
+        const c = &ctx.?;
+        _ = try c.addFont(f.bytes, .{});
+        const metrics = try c.metrics(size_px);
+        const height = @ceil(metrics.ascender - metrics.descender + metrics.line_gap);
+        const glyph = try c.glyph('M', size_px);
+        const width = @ceil(glyph.advance);
+        // Validate before converting: bad float-to-int is UB in ReleaseFast.
+        if (!std.math.isFinite(width) or !std.math.isFinite(height) or width <= 0 or height <= 0 or width > 256 or height > 256) return error.InvalidFontMetrics;
+        cell_h = @intFromFloat(height);
+        cell_w = @intFromFloat(width);
+        try log.print("font {s} bytes={d} hash={x} cell={d}x{d}; regular face only, no shaping/fallback faces\n", .{ f.path, f.bytes.len, hashBytes(f.bytes), cell_w, cell_h });
+    } else {
+        try log.print("font NONE: placeholder render, glyph/raster/atlas SKIPPED\n", .{});
+    }
+    const type_ctx: ?*Type.Context = if (ctx) |*c| c else null;
+    var work = try Work.init(allocator, io, 80, 24, cell_w, cell_h, type_ctx);
+    defer work.deinit();
+    try log.print("ring mirrored={}; screen=80x24 framebuffer={d}x{d}\n", .{ work.ring.mapped, work.frame.width, work.frame.height });
+
+    const corpora = [_]struct { name: []const u8, unit: []const u8 }{
+        .{ .name = "ASCII", .unit = "abcdefghijklmnopqrstuvwxyz 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n" },
+        .{ .name = "controls", .unit = "\x1b[32mgreen\x1b[0m text\tend\r\n\x1b[2K\x1b[1G\x1b[4munderlined\x1b[0m\r\n" },
+        .{ .name = "mixed-UTF8", .unit = "ASCII 汉字测试 あア 한 café © →\r\n" },
+    };
+    for (corpora) |corpus| {
+        const payload = try makePayload(allocator, corpus.unit);
+        defer allocator.free(payload);
+        work.payload = payload;
+        work.loadPayload();
+        try log.print("\ninput {s}: corpus/raw={d} B; parse/VT start with all bytes retained, no loss\n", .{ corpus.name, payload.len });
+        try run(&log, opt, &work, .ingest, "synthetic ring overwrite copy", .bytes, payload.len, opt.iterations);
+        try run(&log, opt, &work, .lines, "line scan all input", .bytes, payload.len, opt.iterations);
+        try run(&log, opt, &work, .runs_all, "split runs all lines", .bytes, payload.len, opt.iterations);
+        work.loadPayload();
+        work.ring.consumeAndPreparse();
+        work.ring.splitIntoRuns(work.ring.getLastNLines(24));
+        const selected = runBytes(&work.ring);
+        try log.print("last-24 experiment: scanned={d} selected/feed={d} B; NOT runtime semantics\n", .{ payload.len, selected });
+        try run(&log, opt, &work, .runs_last, "split runs selected last-24", .bytes, selected, opt.iterations);
+        try run(&log, opt, &work, .parse_all, "scan+split all input", .bytes, payload.len, opt.iterations);
+        try run(&log, opt, &work, .parse_last, "scan+split last-24 (scanned B)", .bytes, payload.len, opt.iterations);
+        try run(&log, opt, &work, .vt_all, "VT feed all (reset excluded)", .bytes, payload.len, opt.iterations);
+        try run(&log, opt, &work, .vt_last, "VT feed selected last-24", .bytes, selected, opt.iterations);
+        try run(&log, opt, &work, .pipeline, "ingest->all VT->render->copy", .bytes, payload.len, opt.iterations);
+        try log.print("  pipeline/pass raw={d} fed={d} scanned={d} dropped=0 final-unread={d} max-retained={d} chunks={d} renders/copies={d}\n", .{
+            payload.len, work.pipeline_fed, work.pipeline_scanned, work.ring.head - work.ring.tail, work.max_unread, work.pipeline_chunks, work.pipeline_chunks,
+        });
+    }
+    // Corpus allocations above are scoped to each loop iteration.
+    work.payload = &.{};
+    try log.print("\nlossy firehose: synthetic memcpy ingestion only; 4 MiB/op, 64 KiB retained, no parse/VT\n", .{});
+    const firehose = try makePayload(allocator, "synthetic lossy firehose ring fill\r\n");
+    defer allocator.free(firehose);
+    work.payload = firehose;
+    try run(&log, opt, &work, .firehose, "overrun ring ingest", .bytes, 4 * 1024 * 1024, opt.iterations);
+    work.payload = &.{};
+    try log.print("\nunicode width: queries, NOT bytes\n", .{});
+    try run(&log, opt, &work, .width_ascii, "cellWidth ASCII", .queries, 128, opt.iterations);
+    try run(&log, opt, &work, .width_bmp, "cellWidth U+0000..U+2FFF", .queries, 0x3000, opt.iterations);
+    try run(&log, opt, &work, .width_cjk, "cellWidth CJK range", .queries, 4096, opt.iterations);
+
+    try renderSuite(&log, opt, &work, opt.iterations);
+    if (type_ctx != null) {
+        try log.print("\nfonts: glyph queries (not coverage bandwidth); cache hits peek without refreshing LRU\n", .{});
+        try run(&log, opt, &work, .glyph_ascii, "glyph hot ASCII table", .queries, 95, opt.iterations);
+        try run(&log, opt, &work, .glyph_lru, "glyph hot non-ASCII cache", .queries, lru_cps.len, opt.iterations);
+        try run(&log, opt, &work, .peek_lru, "peekGlyph non-ASCII cache", .queries, lru_cps.len, opt.iterations);
+        try run(&log, opt, &work, .atlas_reset, "clearAtlas INCLUDING ASCII prewarm", .operations, 1, opt.iterations);
+        try run(&log, opt, &work, .raster, "rasterize A incl alloc/free", .operations, 1, opt.iterations);
+        try run(&log, opt, &work, .atlas, "atlas pack+blit A", .operations, 1, opt.iterations);
+    }
+    // Both representative large sizes run in quick mode, with bounded repetitions.
+    const large_iters: u32 = if (opt.quick) 1 else @max(1, (opt.iterations + 4) / 5);
     const sizes = [_][2]u16{
         .{ 220, 60 },
         .{ @intCast(@max(1, 3840 / cell_w)), @intCast(@max(1, 2160 / cell_h)) },
     };
-
     for (sizes) |wh| {
-        const scols = wh[0];
-        const srows = wh[1];
-        var dummy: [1]u8 = .{0};
-        var term = try VtState.init(gpa, scols, srows, srows, dummy[0..]);
-        defer term.deinit();
-        fillAsciiScreen(&term);
+        var large = try Work.init(allocator, io, wh[0], wh[1], cell_w, cell_h, type_ctx);
+        defer large.deinit();
+        try renderSuite(&log, opt, &large, large_iters);
+    }
+    try log.print("\nchecksum {x} (observable state/pixels; not a portable golden)\n", .{work.checksum});
+    try saveLog(io, &log, stamp.file, git.hash, std.mem.eql(u8, git.status, "dirty"));
+}
 
-        var frame = try Draw.Frame.init(gpa, @as(u32, scols) * cell_w, @as(u32, srows) * cell_h);
-        defer frame.deinit();
-        const fb_bytes = frame.pixels.len * @sizeOf(u32);
-        const px = frame.width * frame.height;
-        out(
-            "large  {d}x{d}  fb {d}x{d} ({d} px, {d} KiB)\n",
-            .{ scols, srows, frame.width, frame.height, px, fb_bytes / 1024 },
-        );
+const Operation = enum {
+    ingest,
+    firehose,
+    lines,
+    runs_all,
+    runs_last,
+    parse_all,
+    parse_last,
+    vt_all,
+    vt_last,
+    pipeline,
+    width_ascii,
+    width_bmp,
+    width_cjk,
+    full,
+    skip,
+    single,
+    line,
+    cursor,
+    selection,
+    scroll,
+    resize,
+    copy,
+    memset,
+    glyph_ascii,
+    glyph_lru,
+    peek_lru,
+    atlas_reset,
+    raster,
+    atlas,
+};
+const Metric = enum { bytes, queries, frames, operations };
 
-        type_ctx.stats = .{};
-        var fill_ns: u64 = 0;
-        var glyph_ns: u64 = 0;
-        var i: u32 = 0;
-        const t_serial = nowNs();
-        while (i < refresh_iters) : (i += 1) {
-            frame.invalidate();
-            term.markDirtyAll();
-            frame.render(&term, cell_w, cell_h, type_ctx, size_px);
-            fill_ns += frame.last_fill_ns;
-            glyph_ns += frame.last_glyph_ns;
-        }
-        rowFrame("draw.render FULL x60", nowNs() - t_serial, refresh_iters, fb_bytes);
-        out(
-            "    fillRect {d:.3} ms ({d:.3} ms/f)   blit+lookup {d:.3} ms ({d:.3} ms/f)\n",
-            .{
-                nsMs(fill_ns),
-                nsMs(fill_ns) / @as(f64, refresh_iters),
-                nsMs(glyph_ns),
-                nsMs(glyph_ns) / @as(f64, refresh_iters),
+const Work = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ring: CircBuffer,
+    term: VtState,
+    frame: Draw.Frame,
+    copy_pixels: []u32,
+    type_ctx: ?*Type.Context,
+    cell_w: u32,
+    cell_h: u32,
+    base_cols: u16,
+    base_rows: u16,
+    payload: []const u8 = &.{},
+    sel: Select.State = .{},
+    checksum: u64 = 0,
+    query_acc: u64 = 0,
+    pipeline_fed: usize = 0,
+    pipeline_scanned: u64 = 0,
+    pipeline_chunks: usize = 0,
+    max_unread: u64 = 0,
+    bitmap: ?Type.TrueType.Bitmap = null,
+    atlas: ?Type.Atlas = null,
+    glyph_id: u16 = 0,
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, cols: u16, rows: u16, cw: u32, ch: u32, ctx: ?*Type.Context) !Work {
+        var ring = try CircBuffer.create(allocator, ring_cap);
+        errdefer ring.destroy();
+        var term = try VtState.init(allocator, cols, rows, @max(1000, @as(u32, rows) * 2), ring.storage);
+        errdefer term.deinit();
+        var frame = try Draw.Frame.init(allocator, @as(u32, cols) * cw, @as(u32, rows) * ch);
+        errdefer frame.deinit();
+        const copy_pixels = try allocator.alloc(u32, frame.pixels.len);
+        @memset(copy_pixels, 0);
+        return .{ .allocator = allocator, .io = io, .ring = ring, .term = term, .frame = frame, .copy_pixels = copy_pixels, .type_ctx = ctx, .cell_w = cw, .cell_h = ch, .base_cols = cols, .base_rows = rows };
+    }
+
+    fn deinit(self: *Work) void {
+        if (self.bitmap) |bmp| self.allocator.free(bmp.pixels);
+        if (self.atlas) |*a| a.deinit();
+        self.allocator.free(self.copy_pixels);
+        self.frame.deinit();
+        self.term.deinit();
+        self.ring.destroy();
+    }
+
+    fn loadPayload(self: *Work) void {
+        self.ring.head = 0;
+        self.ring.tail = 0;
+        self.ring.hold_at_head = 0;
+        ingest(&self.ring, self.payload);
+    }
+
+    fn prepare(self: *Work, op: Operation) !void {
+        self.sel = .{};
+        self.query_acc = 0;
+        self.loadPayload();
+        switch (op) {
+            .runs_all, .runs_last => self.ring.consumeAndPreparse(),
+            .vt_all, .vt_last => {
+                _ = self.ring.consumeAndGetRuns(if (op == .vt_last) 24 else std.math.maxInt(usize));
             },
-        );
-        out("\n", .{});
+            .pipeline => {
+                self.ring.head = 0;
+                self.ring.tail = 0;
+                self.term.reset();
+                self.frame.invalidate();
+            },
+            .full, .skip, .single, .line, .cursor, .selection, .scroll, .resize, .copy, .memset => {
+                try self.term.resize(self.base_cols, self.base_rows);
+                try self.frame.resize(@as(u32, self.base_cols) * self.cell_w, @as(u32, self.base_rows) * self.cell_h);
+                fillScreen(&self.term);
+                // Isolate dirty-cell/selection/scroll work from cursor movement.
+                self.term.flags.cursor_visible = op == .cursor;
+                self.frame.invalidate();
+                self.frame.render(&self.term, self.cell_w, self.cell_h, self.type_ctx, size_px);
+                self.term.clearDirty();
+            },
+            .glyph_ascii, .glyph_lru, .peek_lru, .atlas_reset, .raster, .atlas => {
+                const ctx = self.type_ctx.?;
+                var cp: u21 = 32;
+                while (cp < 127) : (cp += 1) _ = try ctx.glyph(cp, size_px);
+                for (lru_cps) |c| _ = try ctx.glyph(c, size_px);
+                ctx.stats = .{};
+                if (op == .raster or op == .atlas) {
+                    const font = ctx.faces.items[0].font;
+                    self.glyph_id = (try font.glyphIndex('A')) orelse return error.GlyphNotFound;
+                    if (self.bitmap == null) self.bitmap = try font.rasterize(self.allocator, self.glyph_id, size_px);
+                    if (self.bitmap.?.width == 0 or self.bitmap.?.height == 0 or self.bitmap.?.color) return error.InvalidRasterBitmap;
+                    if (self.atlas == null) self.atlas = try Type.Atlas.init(self.allocator, 1024, 1024);
+                    self.atlas.?.clear();
+                }
+            },
+            else => {},
+        }
+    }
+
+    // Mutations/reset are excluded for isolated stages. resize and pipeline include
+    // their mutations, allocations/reflow, and render/copy in the timed operation.
+    fn prepareIteration(self: *Work, op: Operation, i: u32) void {
+        const cp: u21 = if (i % 2 == 0) '#' else '@';
+        switch (op) {
+            .lines, .parse_all, .parse_last => {
+                self.ring.tail = 0;
+                self.ring.hold_at_head = 0;
+            },
+            .vt_all, .vt_last => self.term.reset(),
+            .full => {
+                self.frame.invalidate();
+                self.term.markDirtyAll();
+            },
+            .skip, .single, .line, .cursor, .selection, .scroll => {
+                self.term.clearDirty();
+                const row = self.term.rows / 2;
+                if (op == .single or op == .line) {
+                    self.term.grid().cursor = .{ .row = row, .col = 0 };
+                    self.term.grid().wrap_pending = false;
+                    const count: u16 = if (op == .single) 1 else self.term.cols;
+                    var col: u16 = 0;
+                    while (col < count) : (col += 1) self.term.printCodepoint(cp);
+                } else if (op == .cursor) {
+                    self.term.grid().cursor = .{ .row = row, .col = @intCast(i % self.term.cols) };
+                    self.term.grid().wrap_pending = false;
+                } else if (op == .selection) {
+                    self.sel.begin(0, row);
+                    self.sel.extend(@intCast(1 + i % (self.term.cols - 1)), row + 1);
+                } else if (op == .scroll) {
+                    // ESC D equivalent: one-row full-screen index followed by
+                    // distinct new text. Cursor at bottom ensures real scrolling.
+                    self.term.grid().cursor = .{ .row = self.term.rows - 1, .col = 0 };
+                    self.term.grid().wrap_pending = false;
+                    self.term.index();
+                    self.term.printCodepoint(cp);
+                }
+            },
+            .atlas => {
+                const bmp = self.bitmap.?;
+                const a = &self.atlas.?;
+                // Capacity maintenance excluded from isolated pack+blit.
+                if (a.shelf_y + a.shelf_h + bmp.height > a.height) a.clear();
+            },
+            else => {},
+        }
+    }
+
+    fn perform(self: *Work, op: Operation, i: u32) !void {
+        switch (op) {
+            .ingest => {
+                ingest(&self.ring, self.payload);
+                std.mem.doNotOptimizeAway(self.ring.storage);
+            },
+            .firehose => {
+                // Each copy observed; this deliberately retains only the last ring.
+                var n: usize = 0;
+                while (n < 4 * 1024 * 1024) {
+                    const count = @min(self.payload.len, 4 * 1024 * 1024 - n);
+                    ingest(&self.ring, self.payload[0..count]);
+                    std.mem.doNotOptimizeAway(self.ring.storage);
+                    n += count;
+                }
+            },
+            .lines => self.ring.consumeAndPreparse(),
+            .runs_all => self.ring.splitIntoRuns(self.ring.lines.items),
+            .runs_last => self.ring.splitIntoRuns(self.ring.getLastNLines(24)),
+            .parse_all, .parse_last => {
+                _ = self.ring.consumeAndGetRuns(if (op == .parse_last) 24 else std.math.maxInt(usize));
+            },
+            .vt_all, .vt_last => self.term.feedRuns(self.ring.runs.items),
+            .pipeline => try self.pipeline(),
+            .width_ascii, .width_bmp, .width_cjk => {
+                var cp: u21 = if (op == .width_cjk) 0x4E00 else 0;
+                const end: u21 = switch (op) {
+                    .width_ascii => 128,
+                    .width_bmp => 0x3000,
+                    else => 0x4E00 + 4096,
+                };
+                // Prevent loop-invariant constant-query elimination/hoisting.
+                while (cp < end) : (cp += 1) {
+                    std.mem.doNotOptimizeAway(&cp);
+                    self.query_acc +%= EastAsian.cellWidth(cp);
+                }
+            },
+            .full, .skip, .single, .line, .cursor, .selection, .scroll => {
+                self.frame.renderSel(&self.term, self.cell_w, self.cell_h, self.type_ctx, size_px, self.sel);
+                std.mem.doNotOptimizeAway(self.frame.pixels);
+            },
+            .resize => {
+                const cols = self.base_cols + @as(u16, @intCast(1 - i % 2));
+                try self.term.resize(cols, self.base_rows);
+                try self.frame.resize(@as(u32, cols) * self.cell_w, @as(u32, self.base_rows) * self.cell_h);
+                self.frame.render(&self.term, self.cell_w, self.cell_h, self.type_ctx, size_px);
+                self.term.clearDirty();
+                std.mem.doNotOptimizeAway(self.frame.pixels);
+            },
+            .copy => {
+                @memcpy(self.copy_pixels, self.frame.pixels);
+                std.mem.doNotOptimizeAway(self.copy_pixels);
+            },
+            .memset => {
+                @memset(self.frame.pixels, i);
+                std.mem.doNotOptimizeAway(self.frame.pixels);
+            },
+            .glyph_ascii => {
+                var cp: u21 = 32;
+                while (cp < 127) : (cp += 1) {
+                    std.mem.doNotOptimizeAway(&cp);
+                    const g = try self.type_ctx.?.glyph(cp, size_px);
+                    self.query_acc +%= g.glyph_id;
+                    std.mem.doNotOptimizeAway(g);
+                }
+            },
+            .glyph_lru, .peek_lru => {
+                for (lru_cps) |codepoint| {
+                    var cp = codepoint;
+                    std.mem.doNotOptimizeAway(&cp);
+                    const g = if (op == .glyph_lru) try self.type_ctx.?.glyph(cp, size_px) else self.type_ctx.?.peekGlyph(cp, size_px) orelse return error.CacheNotWarm;
+                    self.query_acc +%= g.glyph_id;
+                    std.mem.doNotOptimizeAway(g);
+                }
+            },
+            .atlas_reset => {
+                self.type_ctx.?.clearAtlas();
+                std.mem.doNotOptimizeAway(self.type_ctx.?.atlas.pixels);
+            },
+            .raster => {
+                const bmp = try self.type_ctx.?.faces.items[0].font.rasterize(self.allocator, self.glyph_id, size_px);
+                std.mem.doNotOptimizeAway(bmp.pixels);
+                // Retain this output for a checksum after the timed batch;
+                // allocation and freeing the previous same-sized bitmap are timed.
+                self.allocator.free(self.bitmap.?.pixels);
+                self.bitmap = bmp;
+            },
+            .atlas => {
+                const bmp = self.bitmap.?;
+                const a = &self.atlas.?;
+                const rect = a.pack(bmp.width, bmp.height) orelse return error.AtlasFull;
+                a.blit(rect, bmp.pixels);
+                std.mem.doNotOptimizeAway(a.pixels);
+            },
+        }
+        // A memory-clobbering barrier per operation makes writes observable even
+        // when a later repetition replaces the same state. No full-frame hashing
+        // is charged to render/copy timings.
+        std.mem.doNotOptimizeAway(self);
+    }
+
+    fn pipeline(self: *Work) !void {
+        self.pipeline_fed = 0;
+        self.pipeline_scanned = 0;
+        self.pipeline_chunks = 0;
+        self.max_unread = 0;
+        var off: usize = 0;
+        while (off < self.payload.len) {
+            // 4093 intentionally cuts CRLF/UTF8/controls at changing boundaries.
+            const end = @min(off + 4093, self.payload.len);
+            ingest(&self.ring, self.payload[off..end]);
+            const unread = self.ring.head - self.ring.tail;
+            if (unread > self.ring.capacity) return error.PipelineOverrun;
+            self.max_unread = @max(self.max_unread, unread);
+            self.pipeline_scanned += unread;
+            const runs = self.ring.consumeAndGetRuns(std.math.maxInt(usize));
+            self.pipeline_fed += runBytes(&self.ring);
+            self.term.feedRuns(runs);
+            self.frame.render(&self.term, self.cell_w, self.cell_h, self.type_ctx, size_px);
+            self.term.clearDirty();
+            @memcpy(self.copy_pixels, self.frame.pixels);
+            std.mem.doNotOptimizeAway(self.copy_pixels);
+            self.pipeline_chunks += 1;
+            off = end;
+        }
+        if (self.pipeline_fed != self.payload.len or self.ring.tail != self.ring.head) return error.PipelineByteMismatch;
+    }
+
+    fn observe(self: *Work, op: Operation) void {
+        var h: u64 = self.query_acc;
+        switch (op) {
+            .ingest, .firehose => {
+                const start: usize = @intCast((self.ring.head - @min(self.ring.head, self.ring.capacity)) & (self.ring.capacity - 1));
+                h ^= hashBytes(self.ring.storage[start..][0..@intCast(@min(self.ring.head, self.ring.capacity))]);
+            },
+            .lines => {
+                for (self.ring.lines.items) |line| h = (h *% 16777619) ^ line.off ^ line.len;
+            },
+            .runs_all, .runs_last, .parse_all, .parse_last => {
+                for (self.ring.runs.items) |r| h = (h *% 16777619) ^ r.off ^ r.len ^ @intFromEnum(r.kind);
+            },
+            .vt_all, .vt_last => h ^= hashTerm(&self.term),
+            .pipeline => h ^= hashTerm(&self.term) ^ hashBytes(std.mem.sliceAsBytes(self.copy_pixels)),
+            .copy => h ^= hashBytes(std.mem.sliceAsBytes(self.copy_pixels)),
+            .full, .skip, .single, .line, .cursor, .selection, .scroll, .resize, .memset => h ^= hashBytes(std.mem.sliceAsBytes(self.frame.pixels)),
+            .raster => h ^= hashBytes(self.bitmap.?.pixels),
+            .atlas => h ^= hashBytes(self.atlas.?.pixels),
+            .atlas_reset => h ^= hashBytes(self.type_ctx.?.atlas.pixels),
+            else => {},
+        }
+        self.checksum = (self.checksum *% 0x100000001b3) ^ h;
+        std.mem.doNotOptimizeAway(self.checksum);
+    }
+};
+
+fn renderSuite(log: *Log, opt: Options, work: *Work, iterations: u32) !void {
+    try log.print("\nrender {d}x{d}: framebuffer={d}x{d} ({d} B); {d} iterations/batch\n", .{
+        work.base_cols, work.base_rows, work.frame.width, work.frame.height, work.frame.pixels.len * 4, iterations,
+    });
+    try log.print("  Warm glyph cache/snapshot; cursor hidden except cursor case. Dirty scenarios mutate before timing; resize includes reflow/alloc/render.\n  Damage is a bounding band, NOT exact painted pixel bytes.\n", .{});
+    const cases = [_]struct { op: Operation, name: []const u8 }{
+        .{ .op = .full, .name = "full repaint (invalidate)" },
+        .{ .op = .skip, .name = "no-change render" },
+        .{ .op = .single, .name = "single-cell dirty render" },
+        .{ .op = .line, .name = "one-line dirty render" },
+        .{ .op = .cursor, .name = "cursor-move render" },
+        .{ .op = .selection, .name = "selection-change render" },
+        .{ .op = .scroll, .name = "one-row scroll render" },
+        .{ .op = .resize, .name = "resize +/-1 col + render" },
+    };
+    for (cases) |case| try run(log, opt, work, case.op, case.name, .frames, 1, iterations);
+    // Resize changes frame length; restore it before the fixed-size copy tests.
+    try work.term.resize(work.base_cols, work.base_rows);
+    try work.frame.resize(@as(u32, work.base_cols) * work.cell_w, @as(u32, work.base_rows) * work.cell_h);
+    try run(log, opt, work, .copy, "CPU framebuffer memcpy", .bytes, work.copy_pixels.len * 4, iterations);
+    try run(log, opt, work, .memset, "CPU framebuffer memset", .bytes, work.copy_pixels.len * 4, iterations);
+    try log.print("  render-suite checksum={x}\n", .{work.checksum});
+}
+
+const Summary = struct { min: f64, median: f64, p95: f64, max: f64 };
+fn summarize(values: []f64) Summary {
+    std.mem.sort(f64, values, {}, std.sort.asc(f64));
+    const n = values.len;
+    return .{
+        .min = values[0],
+        .median = if (n % 2 == 0) (values[n / 2 - 1] + values[n / 2]) / 2 else values[n / 2],
+        .p95 = values[(n * 95 + 99) / 100 - 1],
+        .max = values[n - 1],
+    };
+}
+
+fn run(log: *Log, opt: Options, work: *Work, op: Operation, name: []const u8, metric: Metric, units: usize, iterations: u32) !void {
+    var samples: [100]f64 = undefined;
+    var damage: u64 = 0;
+    var fill_ns: u64 = 0;
+    var glyph_ns: u64 = 0;
+    var batch: u32 = 0;
+    while (batch < opt.warmup + opt.samples) : (batch += 1) {
+        try work.prepare(op);
+        var elapsed: i128 = 0;
+        var i: u32 = 0;
+        while (i < iterations) : (i += 1) {
+            work.prepareIteration(op, i);
+            const start = nowNs(work.io);
+            try work.perform(op, i);
+            elapsed += nowNs(work.io) - start;
+            // Reject incomplete/failed descriptor construction outside the timer.
+            switch (op) {
+                .lines => {
+                    var scanned: usize = 0;
+                    for (work.ring.lines.items) |line| scanned += line.len;
+                    if (scanned != units) return error.LineByteMismatch;
+                },
+                .runs_all, .runs_last, .parse_all, .vt_all, .vt_last => {
+                    if (runBytes(&work.ring) != units) return error.RunByteMismatch;
+                },
+                .parse_last => try validateParseLast(work, units),
+                .atlas_reset => {
+                    for (work.type_ctx.?.ascii) |glyph| if (glyph == null) return error.IncompleteAsciiPrewarm;
+                },
+                else => {},
+            }
+            if (batch >= opt.warmup and metric == .frames) {
+                damage += if (work.frame.dirty_full) work.frame.height else work.frame.dirty_h;
+                fill_ns += work.frame.last_fill_ns;
+                glyph_ns += work.frame.last_glyph_ns;
+                if (op == .skip and work.frame.damaged()) return error.SkipFrameDamaged;
+                if (op != .skip and !work.frame.damaged()) return error.DirtyFrameNotDamaged;
+            }
+        }
+        work.observe(op);
+        if (batch >= opt.warmup) samples[batch - opt.warmup] = @as(f64, @floatFromInt(@max(elapsed, 1))) / @as(f64, @floatFromInt(iterations));
+    }
+    const stats = summarize(samples[0..opt.samples]);
+    const spread = (stats.max - stats.min) / stats.median * 100;
+    const divisor: f64 = if (metric == .queries) @floatFromInt(units) else 1;
+    const scale: f64 = if (metric == .queries) 1 else 1_000_000;
+    try log.print("  {s}\n    min={d:.6} median={d:.6} p95={d:.6} max={d:.6} {s} spread={d:.1}%", .{
+        name,                                                                                   stats.min / divisor / scale, stats.median / divisor / scale, stats.p95 / divisor / scale, stats.max / divisor / scale,
+        if (metric == .queries) "ns/query" else if (metric == .frames) "ms/frame" else "ms/op", spread,
+    });
+    if (metric == .bytes) try log.print(" input/copy={d} B/op median={d:.2} MiB/s", .{ units, @as(f64, @floatFromInt(units)) / stats.median * 1_000_000_000 / (1024 * 1024) });
+    if (metric == .queries) try log.print(" queries={d}/op median={d:.2} Mquery/s", .{ units, @as(f64, @floatFromInt(units)) / stats.median * 1000 });
+    try log.print(" checksum={x}\n", .{work.checksum});
+    if (metric == .frames) {
+        const count: f64 = @floatFromInt(opt.samples * iterations);
+        try log.print("    mean damage-band={d:.1} pixel-rows/frame fill={d:.3} glyph={d:.3} ms/frame\n", .{
+            @as(f64, @floatFromInt(damage)) / count, @as(f64, @floatFromInt(fill_ns)) / count / 1_000_000, @as(f64, @floatFromInt(glyph_ns)) / count / 1_000_000,
+        });
+    }
+    if (op == .glyph_ascii or op == .glyph_lru) {
+        const stats_g = work.type_ctx.?.stats;
+        try log.print("    last batch hits={d} misses={d} (missing codepoints may use replacement glyph)\n", .{ stats_g.hits, stats_g.misses });
     }
 }
 
-fn fillAsciiScreen(term: *VtState) void {
+fn fillScreen(term: *VtState) void {
     term.reset();
     const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789  ";
-    var ch: usize = 0;
-    var n: u32 = 0;
-    const total: u32 = @as(u32, term.cols) * term.rows;
-    while (n < total) : (n += 1) {
-        term.printCodepoint(alphabet[ch % alphabet.len]);
-        ch += 1;
-    }
-}
-
-fn occupiedCells(term: *const VtState) u32 {
-    var n: u32 = 0;
     var r: u16 = 0;
     while (r < term.rows) : (r += 1) {
+        term.grid().cursor = .{ .row = r, .col = 0 };
+        term.grid().wrap_pending = false;
         var c: u16 = 0;
-        while (c < term.cols) : (c += 1) {
-            const cp = term.cell(r, c).codepoint;
-            if (cp != 0 and cp != ' ') n += 1;
-        }
+        while (c < term.cols) : (c += 1) term.printCodepoint(alphabet[(@as(usize, r) * 7 + c) % alphabet.len]);
     }
-    return n;
+    term.grid().cursor = .{};
+    term.grid().wrap_pending = false;
 }
 
-fn makePayload(gpa: std.mem.Allocator, nbytes: usize, width: u16) ![]u8 {
-    const buf = try gpa.alloc(u8, nbytes);
-    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789  ";
-    var i: usize = 0;
-    var col: u16 = 0;
-    var ch: usize = 0;
-    while (i < buf.len) : (i += 1) {
-        if (col + 1 == width) {
-            buf[i] = '\n';
-            col = 0;
-        } else {
-            buf[i] = alphabet[ch % alphabet.len];
-            ch += 1;
-            col += 1;
-        }
-    }
-    return buf;
+fn makePayload(allocator: std.mem.Allocator, unit: []const u8) ![]u8 {
+    const n = ring_cap / unit.len * unit.len;
+    const payload = try allocator.alloc(u8, n);
+    var off: usize = 0;
+    while (off < n) : (off += unit.len) @memcpy(payload[off..][0..unit.len], unit);
+    return payload;
 }
 
-fn makeCjkPayload(gpa: std.mem.Allocator, nbytes: usize, width: u16) ![]u8 {
-    const buf = try gpa.alloc(u8, nbytes);
-    const han = "汉字测试あア한";
-    var i: usize = 0;
-    var col: u16 = 0;
-    var ch: usize = 0;
-    while (i + 4 < buf.len) {
-        if (col + 2 > width) {
-            buf[i] = '\n';
-            i += 1;
-            col = 0;
-            continue;
-        }
-        const cp_i = ch % (han.len / 3);
-        const slice = han[cp_i * 3 ..][0..3];
-        @memcpy(buf[i..][0..3], slice);
-        i += 3;
-        ch += 1;
-        col += 2;
-    }
-    while (i < buf.len) : (i += 1) buf[i] = '\n';
-    return buf;
-}
-
-fn loadFont(io: std.Io, gpa: std.mem.Allocator) ![]u8 {
-    for (font_paths) |path| {
-        if (loadFontPath(io, gpa, path)) |bytes| return bytes else |_| {}
-    }
-    return error.InvalidFont;
-}
-
-fn loadFontPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
-    const n = try file.length(io);
-    const bytes = try gpa.alloc(u8, n);
-    errdefer gpa.free(bytes);
-    const got = try file.readPositionalAll(io, bytes, 0);
-    if (got != n) return error.InvalidFont;
-    return bytes;
-}
-
-fn fillLines(dest: []u8) void {
-    var i: usize = 0;
-    while (i < dest.len) {
-        const n = @min(line_w, dest.len - i);
-        @memset(dest[i .. i + n], 'x');
-        dest[i + n - 1] = '\n';
-        i += n;
-    }
-}
-
+// Same write/mirror contract as readPTYPump, but explicitly synthetic memory IO.
 fn ingest(buf: *CircBuffer, src: []const u8) void {
-    const cap = buf.capacity;
-    const mask = cap - 1;
     var rest = src;
     while (rest.len != 0) {
-        const off: usize = @intCast(buf.head & mask);
-        const dest = buf.storage[off..][0..cap];
-        const n = @min(dest.len, rest.len);
-        @memcpy(dest[0..n], rest[0..n]);
-        if (!buf.mapped and n != 0) {
-            const a = buf.storage;
-            const first = @min(n, cap - off);
-            if (first != 0) @memcpy(a[off + cap ..][0..first], a[off..][0..first]);
+        const off: usize = @intCast(buf.head & (buf.capacity - 1));
+        const n = @min(buf.capacity, rest.len);
+        @memcpy(buf.storage[off..][0..n], rest[0..n]);
+        if (!buf.mapped) {
+            const first = @min(n, buf.capacity - off);
+            @memcpy(buf.storage[off + buf.capacity ..][0..first], buf.storage[off..][0..first]);
             const extra = n - first;
-            if (extra != 0) @memcpy(a[0..extra], a[cap..][0..extra]);
+            @memcpy(buf.storage[0..extra], buf.storage[buf.capacity..][0..extra]);
         }
         buf.head += n;
         rest = rest[n..];
     }
-}
-
-fn rewindPending(buf: *CircBuffer) void {
-    buf.tail = if (buf.head > buf.capacity) buf.head - buf.capacity else 0;
-    buf.hold_at_head = 0;
-}
-
-fn retainedBytes(buf: *const CircBuffer) u64 {
-    const live = buf.head - buf.tail;
-    return if (live > buf.capacity) buf.capacity else live;
-}
-
-fn lineBytes(lines: []const Line) usize {
-    var n: usize = 0;
-    for (lines) |l| n += l.len;
-    return n;
 }
 
 fn runBytes(buf: *const CircBuffer) usize {
@@ -809,137 +700,239 @@ fn runBytes(buf: *const CircBuffer) usize {
     for (buf.runs.items) |r| n += r.len;
     return n;
 }
-
-fn nowNs() i128 {
-    return @intCast(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds);
+fn validateParseLast(work: *const Work, scanned_units: usize) !void {
+    var scanned: usize = 0;
+    for (work.ring.lines.items) |line| scanned += line.len;
+    if (scanned != scanned_units) return error.LineByteMismatch;
+    var selected: usize = 0;
+    for (work.ring.getLastNLines(24)) |line| selected += line.len;
+    if (runBytes(&work.ring) != selected) return error.SelectedRunByteMismatch;
+}
+fn hashBytes(bytes: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, bytes);
+}
+fn hashTerm(term: *const VtState) u64 {
+    var h: u64 = 0;
+    var r: u16 = 0;
+    while (r < term.rows) : (r += 1) h = (h *% 0x100000001b3) ^ hashBytes(std.mem.sliceAsBytes(term.rowCells(r)));
+    const c = term.cursor();
+    return h ^ (@as(u64, c.row) << 32) ^ c.col;
+}
+fn nowNs(io: std.Io) i128 {
+    return std.Io.Timestamp.now(io, .awake).nanoseconds;
 }
 
-fn nsMs(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+const Font = struct { path: []const u8, bytes: []u8 };
+fn loadFont(io: std.Io, allocator: std.mem.Allocator, override: ?[]const u8) !?Font {
+    if (override) |path| return .{ .path = path, .bytes = loadFile(io, allocator, path, 64 * 1024 * 1024) catch |err| {
+        std.debug.print("bench: font {s}: {s}\n", .{ path, @errorName(err) });
+        return err;
+    } };
+    for (font_paths) |path| {
+        const bytes = loadFile(io, allocator, path, 64 * 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => {
+                std.debug.print("bench: font candidate {s}: {s}\n", .{ path, @errorName(err) });
+                return err;
+            },
+        };
+        return .{ .path = path, .bytes = bytes };
+    }
+    return null;
+}
+fn loadFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const len = try file.length(io);
+    if (len > limit) return error.FileTooLarge;
+    const bytes = try allocator.alloc(u8, @intCast(len));
+    errdefer allocator.free(bytes);
+    if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.ShortRead;
+    return bytes;
 }
 
-fn row(name: []const u8, elapsed_ns: i128, bytes: usize) void {
-    const ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
-    const sec = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
-    const mib_s = if (sec > 0) @as(f64, @floatFromInt(bytes)) / sec / (1024.0 * 1024.0) else 0;
-    out("  {s:<28} {d:10.3} ms  {d:10.1} MiB/s\n", .{ name, ms, mib_s });
+fn machineInfo(log: *Log, allocator: std.mem.Allocator, io: std.Io) !void {
+    // procfs files report length zero, so use a bounded positional read.
+    const file = std.Io.Dir.openFileAbsolute(io, "/proc/cpuinfo", .{}) catch |err| {
+        try log.print("cpu info unavailable: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer file.close(io);
+    const data = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(data);
+    const n = file.readPositionalAll(io, data, 0) catch |err| {
+        try log.print("cpu info unavailable: {s}\n", .{@errorName(err)});
+        return;
+    };
+    var lines = std.mem.splitScalar(u8, data[0..n], '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "model name") or std.mem.startsWith(u8, line, "Hardware")) {
+            try log.print("host cpu {s}\n", .{line});
+            return;
+        }
+    }
+    try log.print("host cpu model unavailable; compare only under similar load/power policy\n", .{});
 }
 
-fn rowFrame(name: []const u8, elapsed_ns: i128, frames: u32, fb_bytes: usize) void {
-    const ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
-    const sec = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
-    const total = fb_bytes * frames;
-    const mib_s = if (sec > 0) @as(f64, @floatFromInt(total)) / sec / (1024.0 * 1024.0) else 0;
-    const per = if (frames == 0) 0 else ms / @as(f64, @floatFromInt(frames));
-    out(
-        "  {s:<28} {d:10.3} ms  {d:10.1} MiB/s  {d:7.3} ms/f  {d:5.1} Hz  {d:5.1}% of 16.7ms\n",
-        .{
-            name,
-            ms,
-            mib_s,
-            per,
-            if (per > 0) 1000.0 / per else 0,
-            per / 16.666666 * 100.0,
-        },
-    );
-}
-
-const Stamp = struct {
-    iso: [20]u8,
-    file: [16]u8,
-};
-
-fn utcStamp(io: std.Io) Stamp {
-    const ts = std.Io.Timestamp.now(io, .real);
-    const secs: u64 = if (ts.nanoseconds <= 0) 0 else @intCast(@divTrunc(ts.nanoseconds, 1_000_000_000));
+const Stamp = struct { iso: [20]u8, file: [18]u8 };
+fn stampForSeconds(secs: u64) !Stamp {
     const es = std.time.epoch.EpochSeconds{ .secs = secs };
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
-    std.debug.print("bench: ns={d} secs={d} y={d} mo={d} d={d} {d}:{d}:{d}\n", .{
-        ts.nanoseconds,
-        secs,
-        yd.year,
-        md.month.numeric(),
-        @as(u8, md.day_index) + 1,
-        ds.getHoursIntoDay(),
-        ds.getMinutesIntoHour(),
-        ds.getSecondsIntoMinute(),
+    var stamp: Stamp = undefined;
+    const iso = try std.fmt.bufPrint(&stamp.iso, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        yd.year, md.month.numeric(), @as(u8, md.day_index) + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     });
-    var iso: [20]u8 = undefined;
-    var file: [16]u8 = undefined;
-    _ = std.fmt.bufPrint(&iso, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        yd.year,
-        md.month.numeric(),
-        @as(u8, md.day_index) + 1,
-        ds.getHoursIntoDay(),
-        ds.getMinutesIntoHour(),
-        ds.getSecondsIntoMinute(),
-    }) catch unreachable;
-    _ = std.fmt.bufPrint(&file, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
-        yd.year,
-        md.month.numeric(),
-        @as(u8, md.day_index) + 1,
-        ds.getHoursIntoDay(),
-        ds.getMinutesIntoHour(),
-        ds.getSecondsIntoMinute(),
-    }) catch unreachable;
-    return .{ .iso = iso, .file = file };
+    const file = try std.fmt.bufPrint(&stamp.file, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
+        yd.year, md.month.numeric(), @as(u8, md.day_index) + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    });
+    if (iso.len != stamp.iso.len or file.len != stamp.file.len) return error.InvalidStamp;
+    return stamp;
+}
+fn utcStamp(io: std.Io) !Stamp {
+    const ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    return stampForSeconds(if (ns <= 0) 0 else @intCast(@divTrunc(ns, 1_000_000_000)));
 }
 
-const Git = struct { hash: []u8, dirty: bool };
-
-fn gitUnknown(gpa: std.mem.Allocator) !Git {
-    return .{ .hash = try gpa.dupe(u8, "unknown"), .dirty = false };
-}
-
-fn gitRev(gpa: std.mem.Allocator, io: std.Io) !Git {
-    const hash_res = std.process.run(gpa, io, .{
-        .argv = &.{ "git", "rev-parse", "--short=12", "HEAD" },
-        .stdout_limit = .limited(64),
-        .stderr_limit = .limited(256),
-    }) catch return gitUnknown(gpa);
-    defer gpa.free(hash_res.stdout);
-    defer gpa.free(hash_res.stderr);
-    switch (hash_res.term) {
-        .exited => |code| if (code != 0) return gitUnknown(gpa),
-        else => return gitUnknown(gpa),
-    }
-    const trimmed = std.mem.trim(u8, hash_res.stdout, " \t\r\n");
-    if (trimmed.len == 0) return gitUnknown(gpa);
-    const hash = try gpa.dupe(u8, trimmed);
-
-    const st = std.process.run(gpa, io, .{
-        .argv = &.{ "git", "status", "--porcelain" },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(256),
-    }) catch return .{ .hash = hash, .dirty = false };
-    defer gpa.free(st.stdout);
-    defer gpa.free(st.stderr);
-    const dirty = switch (st.term) {
-        .exited => |code| code == 0 and std.mem.trim(u8, st.stdout, " \t\r\n").len != 0,
+const Git = struct { hash: []u8, status: []const u8 };
+fn gitRev(allocator: std.mem.Allocator, io: std.Io) !Git {
+    const result = std.process.run(allocator, io, .{ .argv = &.{ "git", "rev-parse", "--short=12", "HEAD" }, .stdout_limit = .limited(64), .stderr_limit = .limited(256) }) catch return .{ .hash = try allocator.dupe(u8, "unknown"), .status = "unknown" };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    const success = switch (result.term) {
+        .exited => |code| code == 0,
         else => false,
     };
-    return .{ .hash = hash, .dirty = dirty };
+    const text = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (!success or text.len == 0) return .{ .hash = try allocator.dupe(u8, "unknown"), .status = "unknown" };
+    for (text) |c| if (!std.ascii.isHex(c)) return error.InvalidGitHash;
+    const hash = try allocator.dupe(u8, text);
+    errdefer allocator.free(hash);
+    const status = std.process.run(allocator, io, .{ .argv = &.{ "git", "status", "--porcelain" }, .stdout_limit = .limited(1024 * 1024), .stderr_limit = .limited(256) }) catch return .{ .hash = hash, .status = "unknown" };
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+    return .{ .hash = hash, .status = switch (status.term) {
+        .exited => |code| if (code != 0) "unknown" else if (std.mem.trim(u8, status.stdout, " \t\r\n").len == 0) "clean" else "dirty",
+        else => "unknown",
+    } };
 }
 
-fn saveLog(io: std.Io, file_stamp: [16]u8, hash: []const u8, dirty: bool) void {
-    const dir = std.Io.Dir.cwd();
-    dir.createDirPath(io, "bench") catch {
-        std.debug.print("bench: could not create bench/\n", .{});
-        return;
-    };
+fn saveLog(io: std.Io, log: *Log, stamp: [18]u8, hash: []const u8, dirty: bool) !void {
+    const cwd = std.Io.Dir.cwd();
     var name_buf: [128]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_buf, "bench/{s}-{s}{s}.txt", .{
-        file_stamp,
-        hash,
-        if (dirty) "-dirty" else "",
-    }) catch return;
-    const data = log_buf.writer.buffered();
-    dir.writeFile(io, .{ .sub_path = name, .data = data }) catch {
-        std.debug.print("bench: could not write {s}\n", .{name});
-        return;
+    const name = try std.fmt.bufPrint(&name_buf, "bench/{s}-{s}{s}.txt", .{ stamp, hash, if (dirty) "-dirty" else "" });
+    cwd.createDirPath(io, "bench") catch |err| {
+        std.debug.print("bench: create bench/: {s}\n", .{@errorName(err)});
+        return err;
     };
-    dir.writeFile(io, .{ .sub_path = "last_bench", .data = data }) catch {};
-    std.debug.print("saved {s}\n", .{name});
+    const data = log.buffer.writer.buffered();
+    cwd.writeFile(io, .{ .sub_path = name, .data = data }) catch |err| {
+        std.debug.print("bench: save {s}: {s}\n", .{ name, @errorName(err) });
+        return err;
+    };
+    cwd.writeFile(io, .{ .sub_path = "last_bench", .data = data }) catch |err| {
+        std.debug.print("bench: save last_bench (stamped log saved): {s}\n", .{@errorName(err)});
+        return err;
+    };
+    std.debug.print("saved {s} and last_bench\n", .{name});
+}
+
+test "benchmark UTC filename is 18 bytes, including leap day and midnight" {
+    const epoch = try stampForSeconds(0);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", &epoch.iso);
+    try std.testing.expectEqualStrings("1970-01-01T000000Z", &epoch.file);
+    const leap = try stampForSeconds(1709251199);
+    try std.testing.expectEqualStrings("2024-02-29T23:59:59Z", &leap.iso);
+    try std.testing.expectEqualStrings("2024-02-29T235959Z", &leap.file);
+    const next = try stampForSeconds(1709251200);
+    try std.testing.expectEqualStrings("2024-03-01T000000Z", &next.file);
+}
+test "benchmark options validate and quick defaults respect explicit counts" {
+    const opt = try parseOptions(&.{ "bench", "--iterations=7", "--quick", "--samples", "1", "--warmup=0", "--font=font.ttf" });
+    try std.testing.expectEqual(@as(u32, 7), opt.iterations);
+    try std.testing.expectEqual(@as(u32, 1), opt.samples);
+    try std.testing.expectEqual(@as(u32, 0), opt.warmup);
+    try std.testing.expectEqualStrings("font.ttf", opt.font.?);
+    const quick = try parseOptions(&.{ "bench", "--quick" });
+    try std.testing.expectEqual(@as(u32, 2), quick.iterations);
+    try std.testing.expectEqual(@as(u32, 3), quick.samples);
+    try std.testing.expectError(error.InvalidCount, parseOptions(&.{ "bench", "--samples=0" }));
+    try std.testing.expectError(error.InvalidCount, parseOptions(&.{ "bench", "--iterations=-1" }));
+    try std.testing.expectError(error.InvalidCount, parseOptions(&.{ "bench", "--samples=101" }));
+    try std.testing.expectError(error.UnknownOption, parseOptions(&.{ "bench", "--typo" }));
+    try std.testing.expectError(error.MissingValue, parseOptions(&.{ "bench", "--font" }));
+    try std.testing.expectError(error.DuplicateOption, parseOptions(&.{ "bench", "--quick", "--quick" }));
+    try std.testing.expectError(error.UnexpectedValue, parseOptions(&.{ "bench", "--help=1" }));
+}
+test "benchmark summary uses interpolated median and nearest-rank tail" {
+    var values = [_]f64{ 4, 1, 3, 2 };
+    const s = summarize(&values);
+    try std.testing.expectEqual(@as(f64, 1), s.min);
+    try std.testing.expectEqual(@as(f64, 2.5), s.median);
+    try std.testing.expectEqual(@as(f64, 4), s.p95);
+    try std.testing.expectEqual(@as(f64, 4), s.max);
+}
+
+test "last-24 parser validates scan and selected bytes for ASCII/control/UTF-8" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var work = try Work.init(allocator, io, 80, 24, 8, 16, null);
+    defer work.deinit();
+    const corpora = [_][]const u8{
+        "ascii row one\r\nascii row two\r\n",
+        "\x1b[32mgreen\x1b[0m\tcontrol row\r\n",
+        "mixed 汉字 café →\r\nsecond あ row\r\n",
+    };
+    for (corpora) |corpus| {
+        const payload = try makePayload(allocator, corpus);
+        defer allocator.free(payload);
+        work.payload = payload;
+        try work.prepare(.parse_last);
+        work.prepareIteration(.parse_last, 0);
+        try work.perform(.parse_last, 0);
+        try validateParseLast(&work, payload.len);
+    }
+}
+
+test "incremental headless pipeline feeds every byte and matches one-shot VT" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var work = try Work.init(allocator, io, 80, 24, 8, 16, null);
+    defer work.deinit();
+    const payload = try makePayload(allocator, "ASCII 汉字 café\x1b[32m green\x1b[0m\r\n");
+    defer allocator.free(payload);
+    work.payload = payload;
+    try work.prepare(.pipeline);
+    // No resets between passes: exercise persistent grids and ring wraparound.
+    try work.perform(.pipeline, 0);
+    try work.perform(.pipeline, 1);
+    try std.testing.expectEqual(payload.len, work.pipeline_fed);
+    try std.testing.expectEqual(work.ring.head, work.ring.tail);
+    try std.testing.expect(work.max_unread <= ring_cap);
+    const incremental_hash = hashTerm(&work.term);
+    var baseline = try VtState.init(allocator, 80, 24, 1000, work.ring.storage);
+    defer baseline.deinit();
+    work.loadPayload();
+    const runs = work.ring.consumeAndGetRuns(std.math.maxInt(usize));
+    baseline.feedRuns(runs);
+    baseline.feedRuns(runs);
+    try std.testing.expectEqual(hashTerm(&baseline), incremental_hash);
+    try std.testing.expectEqualSlices(u32, work.frame.pixels, work.copy_pixels);
+}
+
+test "dirty render scenarios actually damage pixels and skip is clean" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var work = try Work.init(allocator, io, 80, 24, 8, 16, null);
+    defer work.deinit();
+    for ([_]Operation{ .skip, .single, .line, .cursor, .selection, .scroll, .full, .resize }) |op| {
+        try work.prepare(op);
+        var i: u32 = 0;
+        while (i < 2) : (i += 1) {
+            work.prepareIteration(op, i);
+            try work.perform(op, i);
+            try std.testing.expectEqual(op != .skip, work.frame.damaged());
+        }
+    }
 }

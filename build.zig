@@ -134,12 +134,12 @@ fn buildExeForTarget(
 }
 
 fn addPeak(mod: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget) void {
-    mod.addIncludePath(b.path("godstack/Peak"));
+    mod.addIncludePath(b.path("vendor/godstack/Peak"));
     // X11 and Wayland headers. After Zig's libc so host bits/math.h
     // cannot shadow the target headers. Those libraries are dlopened.
     mod.addAfterIncludePath(.{ .cwd_relative = "/usr/include" });
     mod.addCSourceFile(.{
-        .file = b.path("godstack/Peak/peak.c"),
+        .file = b.path("vendor/godstack/Peak/peak.c"),
         // Gaming mice can also expose /dev/input/js*: never turn their
         // global joystick events into clicks in every terminal window.
         .flags = &.{ "-std=c99", "-Wno-deprecated-declarations", "-DPEAK_NO_GAMEPAD" },
