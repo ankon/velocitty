@@ -185,6 +185,11 @@ const BytesRaw = extern struct {
     n: usize,
 };
 
+const TextRaw = extern struct {
+    n: usize,
+    bytes: [64]u8,
+};
+
 const FocusRaw = extern struct {
     on: c_int,
 };
@@ -196,7 +201,7 @@ const RawEvent = extern struct {
         resize: ResizeRaw,
         pointer: PointerRaw,
         clip: ClipRaw,
-        text: BytesRaw,
+        text: TextRaw,
         drop: BytesRaw,
         focus: FocusRaw,
     },

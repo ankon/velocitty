@@ -267,7 +267,7 @@ typedef struct {
         struct { uint32_t width, height; } resize;
         struct { PeakPointerState state; PeakPointerType type; float x, y; PeakKeyMod mod; } pointer;
         struct { PeakClip which; size_t n; } clip;
-        struct { size_t n; } text;
+        struct { size_t n; char bytes[64]; } text;
         struct { size_t n; } drop;
         struct { int on; } focus; /* 1 gained, 0 lost */
     };

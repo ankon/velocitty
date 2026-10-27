@@ -228,6 +228,8 @@ int
 peak_window_epoll(PeakWindow *win, PeakEvent *ev)
 {
     int got = peak_platform_epoll(&win->internal, ev);
+    if (got && ev->type == PEAK_EVENT_TEXT)
+        peak_text_store(ev->text.bytes, ev->text.n);
     if (got && ev->type == PEAK_EVENT_WINDOW_RESIZE)
         peak_window_sync(win, NULL, NULL);
     return got;

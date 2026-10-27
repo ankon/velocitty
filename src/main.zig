@@ -638,6 +638,7 @@ const EventLoop = struct {
     fn pump(ptr: *anyopaque) void {
         const self: *EventLoop = @ptrCast(@alignCast(ptr));
         self.drain();
+        self.pty.flush();
     }
 
     fn drain(self: *EventLoop) void {
@@ -1171,6 +1172,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             window.setOpacity(last_alpha);
         }
         flushReply(&pty, &term);
+        pty.flush();
 
         const hold_sync = term.flags.sync_output and sync_hold < hz;
         if (need_draw and !hold_sync) {

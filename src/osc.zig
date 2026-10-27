@@ -50,12 +50,10 @@ pub fn dispatch(vt: *Vt, bytes: []const u8) void {
         66 => osc66(vt, payload),
         104 => osc104(vt, payload),
         110 => {
-            vt.scheme.fg = vt.orig.fg;
-            vt.markDirtyAll();
+            vt.setDefaultColor(true, vt.orig.fg);
         },
         111 => {
-            vt.scheme.bg = vt.orig.bg;
-            vt.markDirtyAll();
+            vt.setDefaultColor(false, vt.orig.bg);
         },
         112 => vt.scheme.cursor = vt.orig.cursor,
         117 => {
@@ -305,6 +303,7 @@ fn osc4(vt: *Vt, payload: []const u8, raw: []const u8) void {
 
 fn osc104(vt: *Vt, payload: []const u8) void {
     if (payload.len == 0) {
+        vt.scheme.palette = vt.orig.palette;
         vt.initTable();
         vt.markDirtyAll();
         return;
@@ -348,8 +347,8 @@ fn oscColor(vt: *Vt, payload: []const u8, raw: []const u8, which: Which, id: u16
     }
     const c = parseColorSpec(payload) orelse return;
     switch (which) {
-        .fg => vt.scheme.fg = c,
-        .bg => vt.scheme.bg = c,
+        .fg => vt.setDefaultColor(true, c),
+        .bg => vt.setDefaultColor(false, c),
         .cursor => vt.scheme.cursor = c,
     }
     vt.markDirtyAll();

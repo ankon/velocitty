@@ -129,6 +129,7 @@ pub const Store = struct {
     chunks: std.ArrayList(u8) = .empty,
     header: std.ArrayList(u8) = .empty,
     assembling: bool = false,
+    discarding: bool = false,
     pending: Command = .{},
     next_id: u32 = 1,
     stream: Stream = .idle,
@@ -161,6 +162,7 @@ pub const Store = struct {
         self.chunks.clearRetainingCapacity();
         self.header.clearRetainingCapacity();
         self.assembling = false;
+        self.discarding = false;
         self.pending = .{};
         self.stream = .idle;
         self.bitmap_used = 0;
@@ -244,40 +246,41 @@ pub const Store = struct {
         if (cmd.action != 't' and cmd.action != 'T' and cmd.action != 0) return null;
         if (cmd.transmission != 'd' and cmd.transmission != 'f' and cmd.transmission != 't') return null;
 
-        if (cmd.more) {
-            if (!self.assembling) {
-                self.pending = cmd;
-                self.chunks.clearRetainingCapacity();
-                self.assembling = true;
-            }
-            self.chunks.appendSlice(self.allocator, cmd.payload) catch {
-                self.assembling = false;
-                self.chunks.clearRetainingCapacity();
-                return null;
-            };
+        // Once a multipart transfer exceeds the limit, ignore its remaining
+        // chunks through m=0 so that a tail cannot become a new image.
+        if (self.discarding) {
+            if (!cmd.more) self.discarding = false;
             return null;
         }
-
-        if (self.assembling) {
-            self.chunks.appendSlice(self.allocator, cmd.payload) catch {
-                self.assembling = false;
-                self.chunks.clearRetainingCapacity();
-                return null;
-            };
-            self.assembling = false;
-            var done = self.pending;
-            done.more = false;
-            done.payload = self.chunks.items;
-            if (cmd.id != 0) done.id = cmd.id;
-            if (cmd.action != 0 and cmd.action != 't') done.action = cmd.action;
-            return self.finish(done, cursor, cols, rows, which);
+        if (!self.assembling) {
+            self.pending = cmd;
+            self.chunks.clearRetainingCapacity();
         }
-
-        self.pending = cmd;
-        self.chunks.clearRetainingCapacity();
-        self.chunks.appendSlice(self.allocator, cmd.payload) catch return null;
-        var done = cmd;
+        if (cmd.payload.len > max_bytes - self.chunks.items.len) {
+            self.fail(self.pending, "EINVAL:transfer too large");
+            self.assembling = false;
+            self.discarding = cmd.more;
+            self.chunks.clearRetainingCapacity();
+            self.pending = .{};
+            return null;
+        }
+        self.chunks.appendSlice(self.allocator, cmd.payload) catch {
+            self.assembling = false;
+            self.discarding = cmd.more;
+            self.chunks.clearRetainingCapacity();
+            self.pending = .{};
+            return null;
+        };
+        if (cmd.more) {
+            self.assembling = true;
+            return null;
+        }
+        self.assembling = false;
+        var done = self.pending;
+        done.more = false;
         done.payload = self.chunks.items;
+        if (cmd.id != 0) done.id = cmd.id;
+        if (cmd.action != 0 and cmd.action != 't') done.action = cmd.action;
         return self.finish(done, cursor, cols, rows, which);
     }
 
@@ -558,15 +561,110 @@ fn decodeB64(allocator: std.mem.Allocator, src: []const u8) error{InvalidImage}!
     return out;
 }
 
+// Temporary files are unlinked only in trusted, directly named temporary
+// directories and only when their basename contains the protocol marker.
+// Restricting this to a single path component also rules out traversal and
+// path traversal through the supplied filename.
+const TempName = struct { dir: []const u8, name: []const u8 };
+
+fn tempInDir(path: []const u8, dir_raw: []const u8) ?TempName {
+    const dir = std.mem.trimEnd(u8, dir_raw, "/");
+    if (dir.len == 0 or dir[0] != '/' or std.mem.indexOfScalar(u8, dir, 0) != null) return null;
+    var parts = std.mem.splitScalar(u8, dir[1..], '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return null;
+    }
+    if (path.len <= dir.len or !std.mem.startsWith(u8, path, dir) or path[dir.len] != '/') return null;
+    const name = path[dir.len + 1 ..];
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null or
+        std.mem.indexOf(u8, name, "tty-graphics-protocol") == null) return null;
+    return .{ .dir = dir, .name = name };
+}
+
+fn tempName(path: []const u8) ?TempName {
+    for ([_][]const u8{ "/tmp", "/var/tmp", "/dev/shm" }) |dir| {
+        if (tempInDir(path, dir)) |result| return result;
+    }
+    if (std.c.getenv("TMPDIR")) |dir| return tempInDir(path, std.mem.span(dir));
+    return null;
+}
+
+fn toZ(path: []const u8, buf: []u8) ?[:0]u8 {
+    if (path.len == 0 or path.len >= buf.len or std.mem.indexOfScalar(u8, path, 0) != null) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0];
+}
+
+fn regularFd(fd: i32) bool {
+    var info: std.os.linux.Statx = undefined;
+    const rc = std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true }, &info);
+    return std.os.linux.errno(rc) == .SUCCESS and info.mask.TYPE and std.os.linux.S.ISREG(info.mode);
+}
+
+fn openRegularAt(dirfd: i32, path: []const u8, nofollow: bool) ?i32 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = toZ(path, &buf) orelse return null;
+    // O_PATH does not open a device or FIFO for I/O. Inspect the object first,
+    // then reopen that exact descriptor through procfs, not the mutable path.
+    const rc = std.os.linux.openat(dirfd, z.ptr, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = nofollow }, 0);
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    const pathfd: i32 = @intCast(rc);
+    defer _ = std.os.linux.close(pathfd);
+    if (!regularFd(pathfd)) return null;
+    var proc_buf: [64]u8 = undefined;
+    const proc_path = std.fmt.bufPrint(&proc_buf, "/proc/self/fd/{d}", .{pathfd}) catch return null;
+    var proc_zbuf: [64]u8 = undefined;
+    const proc_z = toZ(proc_path, &proc_zbuf) orelse return null;
+    const read_rc = std.os.linux.open(proc_z.ptr, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .NOCTTY = true, .CLOEXEC = true }, 0);
+    if (std.os.linux.errno(read_rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(read_rc);
+    if (!regularFd(fd)) {
+        _ = std.os.linux.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+fn openRegular(path: []const u8, nofollow: bool) ?i32 {
+    return openRegularAt(std.os.linux.AT.FDCWD, path, nofollow);
+}
+
 fn loadPayload(allocator: std.mem.Allocator, cmd: Command) error{InvalidImage}![]u8 {
     switch (cmd.transmission) {
         'd' => return decodeB64(allocator, cmd.payload),
         'f', 't' => {
             const path_raw = decodeB64(allocator, cmd.payload) catch return error.InvalidImage;
             defer allocator.free(path_raw);
-            const path = std.mem.trim(u8, path_raw, " \t\r\n\x00");
-            const data = readPath(allocator, path) catch return error.InvalidImage;
-            if (cmd.transmission == 't') unlinkPath(path);
+            const path = std.mem.trim(u8, path_raw, " \t\r\n");
+            if (cmd.transmission == 't') {
+                const temp = tempName(path) orelse return error.InvalidImage;
+                var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const dir_path = toZ(temp.dir, &dir_buf) orelse return error.InvalidImage;
+                const dir_rc = std.os.linux.open(dir_path.ptr, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+                if (std.os.linux.errno(dir_rc) != .SUCCESS) return error.InvalidImage;
+                const dirfd: i32 = @intCast(dir_rc);
+                defer _ = std.os.linux.close(dirfd);
+                const fd = openRegularAt(dirfd, temp.name, true) orelse return error.InvalidImage;
+                defer _ = std.os.linux.close(fd);
+                const data = try readFd(allocator, fd);
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (toZ(temp.name, &buf)) |name| {
+                    var opened: std.os.linux.Statx = undefined;
+                    var named: std.os.linux.Statx = undefined;
+                    const mask: std.os.linux.STATX = .{ .TYPE = true, .INO = true };
+                    const a = std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, mask, &opened);
+                    const b = std.os.linux.statx(dirfd, name.ptr, std.os.linux.AT.SYMLINK_NOFOLLOW, mask, &named);
+                    if (std.os.linux.errno(a) == .SUCCESS and std.os.linux.errno(b) == .SUCCESS and
+                        opened.mask.INO and named.mask.INO and named.mask.TYPE and std.os.linux.S.ISREG(named.mode) and
+                        opened.ino == named.ino and opened.dev_major == named.dev_major and opened.dev_minor == named.dev_minor)
+                        _ = std.os.linux.unlinkat(dirfd, name.ptr, 0);
+                }
+                return data;
+            }
+            const fd = openRegular(path, false) orelse return error.InvalidImage;
+            defer _ = std.os.linux.close(fd);
+            const data = try readFd(allocator, fd);
             return data;
         },
         else => return error.InvalidImage,
@@ -576,35 +674,13 @@ fn loadPayload(allocator: std.mem.Allocator, cmd: Command) error{InvalidImage}![
 fn payloadPathExists(allocator: std.mem.Allocator, payload: []const u8) bool {
     const path_raw = decodeB64(allocator, payload) catch return false;
     defer allocator.free(path_raw);
-    const path = std.mem.trim(u8, path_raw, " \t\r\n\x00");
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(path, &buf) orelse return false;
-    const rc = std.os.linux.open(z.ptr, .{ .ACCMODE = .RDONLY }, 0);
-    if (std.os.linux.errno(rc) != .SUCCESS) return false;
-    _ = std.os.linux.close(@intCast(rc));
+    const path = std.mem.trim(u8, path_raw, " \t\r\n");
+    const fd = openRegular(path, false) orelse return false;
+    _ = std.os.linux.close(fd);
     return true;
 }
 
-fn toZ(path: []const u8, buf: []u8) ?[:0]u8 {
-    if (path.len == 0 or path.len >= buf.len) return null;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    return buf[0..path.len :0];
-}
-
-fn unlinkPath(path: []const u8) void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(path, &buf) orelse return;
-    _ = std.os.linux.unlink(z.ptr);
-}
-
-fn readPath(allocator: std.mem.Allocator, path: []const u8) error{InvalidImage}![]u8 {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(path, &pbuf) orelse return error.InvalidImage;
-    const rc = std.os.linux.open(z.ptr, .{ .ACCMODE = .RDONLY }, 0);
-    if (std.os.linux.errno(rc) != .SUCCESS) return error.InvalidImage;
-    const fd: i32 = @intCast(rc);
-    defer _ = std.os.linux.close(fd);
+fn readFd(allocator: std.mem.Allocator, fd: i32) error{InvalidImage}![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var chunk: [4096]u8 = undefined;
@@ -612,8 +688,8 @@ fn readPath(allocator: std.mem.Allocator, path: []const u8) error{InvalidImage}!
         const k = std.os.linux.read(fd, &chunk, chunk.len);
         if (std.os.linux.errno(k) != .SUCCESS) return error.InvalidImage;
         if (k == 0) break;
+        if (k > max_bytes - out.items.len) return error.InvalidImage;
         out.appendSlice(allocator, chunk[0..k]) catch return error.InvalidImage;
-        if (out.items.len > max_bytes) return error.InvalidImage;
     }
     if (out.items.len == 0) return error.InvalidImage;
     return out.toOwnedSlice(allocator) catch return error.InvalidImage;
@@ -791,4 +867,124 @@ test "file transmit places png" {
     try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
     try std.testing.expectEqual(@as(usize, 1), store.placements.items.len);
     try std.testing.expectEqualStrings("\x1b_Gi=9;OK\x1b\\", store.reply[0..store.reply_len]);
+}
+
+test "multipart transfer cap discards through final chunk and recovers" {
+    const gpa = std.testing.allocator;
+    var store = Store.init(gpa);
+    defer store.deinit();
+    const payload = try gpa.alloc(u8, max_bytes);
+    defer gpa.free(payload);
+    @memset(payload, 'A');
+    const first = try std.fmt.allocPrint(gpa, "a=t,i=42,m=1;{s}", .{payload});
+    defer gpa.free(first);
+    _ = store.feed(first, .{}, 8, 8, 0);
+    try std.testing.expectEqual(max_bytes, store.chunks.items.len);
+    _ = store.feed("m=1;AAAA", .{}, 8, 8, 0);
+    try std.testing.expect(!store.assembling and store.discarding);
+    try std.testing.expectEqual(@as(usize, 0), store.chunks.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, store.reply[0..store.reply_len], "EINVAL") != null);
+    _ = store.feed("m=0;AAAA", .{}, 8, 8, 0);
+    try std.testing.expect(!store.discarding);
+    _ = store.feed("a=T,f=100,i=4,C=1;" ++ png_1x1_b64, .{}, 8, 8, 0);
+    try std.testing.expectEqual(@as(usize, 1), store.images.items.len);
+}
+
+test "file transfer rejects FIFO and unsafe temporary deletion" {
+    const gpa = std.testing.allocator;
+    var ordinary_buf: [128]u8 = undefined;
+    var fifo_buf: [128]u8 = undefined;
+    var temp_buf: [128]u8 = undefined;
+    var link_buf: [128]u8 = undefined;
+    const pid = std.os.linux.getpid();
+    const ordinary = try std.fmt.bufPrint(ordinary_buf[0 .. ordinary_buf.len - 1], "/tmp/velocitty-kitty-ordinary-{d}", .{pid});
+    const fifo = try std.fmt.bufPrint(fifo_buf[0 .. fifo_buf.len - 1], "/tmp/velocitty-kitty-fifo-{d}", .{pid});
+    const temp = try std.fmt.bufPrint(temp_buf[0 .. temp_buf.len - 1], "/tmp/tty-graphics-protocol-{d}", .{pid});
+    const link = try std.fmt.bufPrint(link_buf[0 .. link_buf.len - 1], "/tmp/tty-graphics-protocol-link-{d}", .{pid});
+    ordinary_buf[ordinary.len] = 0;
+    const ordinary_z = ordinary_buf[0..ordinary.len :0];
+    fifo_buf[fifo.len] = 0;
+    const fifo_z = fifo_buf[0..fifo.len :0];
+    temp_buf[temp.len] = 0;
+    const temp_z = temp_buf[0..temp.len :0];
+    link_buf[link.len] = 0;
+    const link_z = link_buf[0..link.len :0];
+    const rc = std.os.linux.open(ordinary_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
+    defer _ = std.os.linux.unlink(ordinary_z.ptr);
+    const fd: i32 = @intCast(rc);
+    try std.testing.expectEqual(@as(usize, 4), std.os.linux.write(fd, "abcd", 4));
+    _ = std.os.linux.close(fd);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.mknod(fifo_z.ptr, std.os.linux.S.IFIFO | 0o600, 0)));
+    defer _ = std.os.linux.unlink(fifo_z.ptr);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.symlink(ordinary_z.ptr, link_z.ptr)));
+    defer _ = std.os.linux.unlink(link_z.ptr);
+    try std.testing.expect(openRegular(fifo, false) == null);
+    try std.testing.expect(openRegular(link, true) == null);
+    const followed = openRegular(link, false) orelse return error.TestUnexpectedResult;
+    _ = std.os.linux.close(followed);
+    for ([_][]const u8{ ordinary, fifo, link }) |path| {
+        const encoded = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(path.len));
+        defer gpa.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, path);
+        try std.testing.expectError(error.InvalidImage, loadPayload(gpa, .{ .transmission = 't', .payload = encoded }));
+    }
+    const check = openRegular(ordinary, false) orelse return error.TestUnexpectedResult;
+    _ = std.os.linux.close(check);
+    try std.testing.expect(tempName("/tmp/../etc/tty-graphics-protocol-x") == null);
+    try std.testing.expect(tempName("/tmp/sub/tty-graphics-protocol-x") == null);
+    const tmp_fd_rc = std.os.linux.open(temp_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(tmp_fd_rc));
+    defer _ = std.os.linux.unlink(temp_z.ptr);
+    const tmp_fd: i32 = @intCast(tmp_fd_rc);
+    try std.testing.expectEqual(@as(usize, 4), std.os.linux.write(tmp_fd, "abcd", 4));
+    _ = std.os.linux.close(tmp_fd);
+    const encoded = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(temp.len));
+    defer gpa.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, temp);
+    const data = try loadPayload(gpa, .{ .transmission = 't', .payload = encoded });
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("abcd", data);
+    try std.testing.expect(openRegular(temp, false) == null);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "temporary transfer honors absolute TMPDIR and anchors its directory" {
+    const allocator = std.testing.allocator;
+    const old = if (std.c.getenv("TMPDIR")) |p| try allocator.dupeSentinel(u8, std.mem.span(p), 0) else null;
+    defer if (old) |value| {
+        _ = setenv("TMPDIR", value.ptr, 1);
+        allocator.free(value);
+    } else {
+        _ = unsetenv("TMPDIR");
+    };
+    var dir_buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(dir_buf[0 .. dir_buf.len - 1], "/tmp/velocitty-kitty-dir-{d}", .{std.os.linux.getpid()});
+    dir_buf[dir.len] = 0;
+    const dir_z = dir_buf[0..dir.len :0];
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.mkdir(dir_z.ptr, 0o700)));
+    defer _ = std.os.linux.rmdir(dir_z.ptr);
+    try std.testing.expectEqual(@as(c_int, 0), setenv("TMPDIR", dir_z.ptr, 1));
+    const path = try std.fmt.allocPrint(allocator, "{s}/tty-graphics-protocol-test", .{dir});
+    defer allocator.free(path);
+    var path_buf: [256]u8 = undefined;
+    const path_z = toZ(path, &path_buf) orelse unreachable;
+    const rc = std.os.linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, 0o600);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
+    defer _ = std.os.linux.unlink(path_z.ptr);
+    const fd: i32 = @intCast(rc);
+    try std.testing.expectEqual(@as(usize, 4), std.os.linux.write(fd, "data", 4));
+    _ = std.os.linux.close(fd);
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(path.len));
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, path);
+    const data = try loadPayload(allocator, .{ .transmission = 't', .payload = encoded });
+    defer allocator.free(data);
+    try std.testing.expectEqualStrings("data", data);
+    try std.testing.expect(openRegular(path, false) == null);
+    try std.testing.expect(tempInDir("/some/tty-graphics-protocol-x", "relative") == null);
+    try std.testing.expect(tempInDir("/some/tty-graphics-protocol-x", "/some/../some") == null);
+    try std.testing.expect(openRegular("/dev/null", false) == null);
 }

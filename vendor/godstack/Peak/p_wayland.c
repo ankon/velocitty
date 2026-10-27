@@ -1422,10 +1422,12 @@ peak_wayland_key_emit(struct peak_wayland_win *w, uint32_t key, int down, int co
 		return;
 	if (ev.key.key == PEAK_KEY_DELETE || ev.key.key == PEAK_KEY_BACKSPACE)
 		return;
-	peak_text_store(buf, n);
+	if ((ev.key.mod & (PEAK_KEYMOD_CTRL | PEAK_KEYMOD_ALT | PEAK_KEYMOD_SUPER)) && n == 1 && (unsigned char)buf[0] < 128)
+		return;
 	memset(&ev, 0, sizeof ev);
 	ev.type = PEAK_EVENT_TEXT;
 	ev.text.n = n;
+	memcpy(ev.text.bytes, buf, n);
 	peak_q_push(&w->q, ev);
 }
 

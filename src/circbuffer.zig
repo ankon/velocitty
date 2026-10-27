@@ -655,6 +655,89 @@ fn append(buf: *CircBuffer, src: []const u8) void {
     buf.head += src.len;
 }
 
+test "firehose overrun drops oldest bytes and retains only ring capacity" {
+    const gpa = std.testing.allocator;
+    // A small capacity exercises heap mirroring; a page-sized capacity also
+    // exercises hardware mirroring when it is available.
+    for ([_]usize{ 64, std.heap.pageSize() }) |cap| {
+        var buf = try CircBuffer.create(gpa, cap);
+        defer buf.destroy();
+        const old = try gpa.alloc(u8, cap);
+        defer gpa.free(old);
+        @memset(old, 'Z');
+        const latest = try gpa.alloc(u8, cap);
+        defer gpa.free(latest);
+        for (latest, 0..) |*byte, i| {
+            byte.* = if (i % 17 == 0) '\n' else 'a' + @as(u8, @intCast(i % 26));
+        }
+
+        // Do not consume between writes. More than two ringfuls arrive, and
+        // the final ringful starts at a nonzero offset and crosses the mirror.
+        append(&buf, old);
+        append(&buf, old[0 .. cap - 7]);
+        append(&buf, latest);
+        const written: u64 = @intCast(cap * 3 - 7);
+        try std.testing.expectEqual(written, buf.head);
+        try std.testing.expectEqual(@as(u64, 0), buf.tail);
+        try std.testing.expect(buf.pending());
+
+        buf.consumeAndPreparse();
+        try std.testing.expectEqual(written - cap, buf.tail);
+        try std.testing.expectEqual(@as(u64, @intCast(cap)), buf.head - buf.tail);
+        var line_bytes: usize = 0;
+        for (buf.lines.items) |line| line_bytes += line.len;
+        try std.testing.expectEqual(cap, line_bytes);
+
+        const runs = buf.consumeAndGetRuns(std.math.maxInt(usize));
+        var fed: usize = 0;
+        for (runs) |run| {
+            try std.testing.expect(fed + run.len <= latest.len);
+            try std.testing.expectEqualSlices(u8, latest[fed..][0..run.len], buf.storage[run.off..][0..run.len]);
+            fed += run.len;
+        }
+        try std.testing.expectEqual(cap, fed);
+        try std.testing.expectEqual(cap, buf.capacity);
+        try std.testing.expectEqual(cap * 2, buf.storage.len);
+        try std.testing.expectEqual(buf.head, buf.tail);
+        try std.testing.expect(!buf.pending());
+    }
+}
+
+test "firehose readPTY drains past capacity until EOF" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const cap = 64;
+    var buf = try CircBuffer.create(std.testing.allocator, cap);
+    defer buf.destroy();
+
+    var fds: [2]i32 = undefined;
+    const pipe_rc = std.os.linux.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true });
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pipe_rc));
+    defer _ = std.os.linux.close(fds[0]);
+    var writer_open = true;
+    defer if (writer_open) {
+        _ = std.os.linux.close(fds[1]);
+    };
+
+    // Fit in a pipe without a reader thread, but require many ringful reads.
+    var payload: [1024]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = 'a' + @as(u8, @intCast(i % 26));
+    const written = std.os.linux.write(fds[1], &payload, payload.len);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(written));
+    try std.testing.expectEqual(payload.len, written);
+    _ = std.os.linux.close(fds[1]);
+    writer_open = false;
+
+    try std.testing.expectError(error.Hangup, buf.readPTY(fds[0], 1000));
+    try std.testing.expectEqual(@as(u64, payload.len), buf.head);
+    try std.testing.expectEqual(@as(u64, 0), buf.tail);
+    const runs = buf.consumeAndGetRuns(std.math.maxInt(usize));
+    try std.testing.expectEqual(@as(usize, 1), runs.len);
+    try std.testing.expectEqual(@as(u32, cap), runs[0].len);
+    try std.testing.expectEqualSlices(u8, payload[payload.len - cap ..], buf.storage[runs[0].off..][0..cap]);
+    try std.testing.expectEqual(buf.head, buf.tail);
+    try std.testing.expect(!buf.pending());
+}
+
 test "hold incomplete csi until final" {
     const gpa = std.testing.allocator;
     const cap = std.heap.pageSize();

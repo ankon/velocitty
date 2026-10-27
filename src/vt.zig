@@ -255,6 +255,29 @@ pub const VtState = struct {
         self.markDirtyAll();
     }
 
+    /// Update cells and pens that still refer to terminal defaults, preserving
+    /// explicitly selected colors even when their RGB happens to match.
+    pub fn setDefaultColor(self: *VtState, fg: bool, c: Color) void {
+        if (fg) self.scheme.fg = c else self.scheme.bg = c;
+        for (&self.grids) |*g| {
+            for (g.cells) |*slot| {
+                if (fg) {
+                    if (!slot.attrs.fg_explicit) slot.fg = c;
+                } else {
+                    if (!slot.attrs.bg_explicit) slot.bg = c;
+                }
+            }
+            if (fg) {
+                if (!g.attrs.fg_explicit) g.fg = c;
+                if (!g.saved_attrs.fg_explicit) g.saved_fg = c;
+            } else {
+                if (!g.attrs.bg_explicit) g.bg = c;
+                if (!g.saved_attrs.bg_explicit) g.saved_bg = c;
+            }
+        }
+        self.markDirtyAll();
+    }
+
     pub fn feedRuns(self: *VtState, runs: []const Run) void {
         for (runs) |run| {
             const slice = self.storage[run.off .. run.off + run.len];
@@ -504,7 +527,7 @@ pub const VtState = struct {
 
     pub fn eraseCell(self: *const VtState) Cell {
         const g = self.gridConst();
-        return .{ .fg = g.fg, .bg = g.bg };
+        return .{ .fg = g.fg, .bg = g.bg, .attrs = .{ .fg_explicit = g.attrs.fg_explicit, .bg_explicit = g.attrs.bg_explicit } };
     }
 
     pub fn cup(self: *VtState, row1: u16, col1: u16) void {
@@ -837,7 +860,13 @@ pub const VtState = struct {
         if (rest[0] == 5) {
             if (rest.len < 2) return rest.len;
             const c = indexedColor(self.scheme, rest[1]);
-            if (fg) self.grid().fg = c else self.grid().bg = c;
+            if (fg) {
+                self.grid().fg = c;
+                self.grid().attrs.fg_explicit = true;
+            } else {
+                self.grid().bg = c;
+                self.grid().attrs.bg_explicit = true;
+            }
             return 2;
         }
         if (rest[0] == 2) {
@@ -860,7 +889,13 @@ pub const VtState = struct {
             .g = clip(g),
             .b = clip(b),
         };
-        if (fg) self.grid().fg = c else self.grid().bg = c;
+        if (fg) {
+            self.grid().fg = c;
+            self.grid().attrs.fg_explicit = true;
+        } else {
+            self.grid().bg = c;
+            self.grid().attrs.bg_explicit = true;
+        }
     }
 
     pub fn setMode(self: *VtState, params: []const u32, enable: bool) void {
@@ -1318,8 +1353,8 @@ pub const VtState = struct {
         if (slot == 0) slot = self.color_stack_idx;
         if (slot == 0 or slot > self.color_stack_size) return;
         const snap = self.color_stack[@intCast(slot - 1)];
-        self.scheme.fg = snap.fg;
-        self.scheme.bg = snap.bg;
+        self.setDefaultColor(true, snap.fg);
+        self.setDefaultColor(false, snap.bg);
         self.scheme.cursor = snap.cursor;
         self.table = snap.table;
         self.color_stack_idx = @intCast(slot - 1);
@@ -2160,4 +2195,80 @@ test "osc 556 debug overlay" {
     try std.testing.expect(!vt.debug_overlay.any());
     Osc.dispatch(&vt, "\x1b]556;off\x07");
     try std.testing.expect(!vt.debug_overlay.any());
+}
+
+test "full region delete lines clears without underflow" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 2, &dummy);
+    defer vt.deinit();
+    vt.printCodepoint('A');
+    applyCsi(&vt, "\x1b[H");
+    applyCsi(&vt, "\x1b[2M");
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(0, 0).codepoint);
+    try std.testing.expectEqual(@as(u21, ' '), vt.grid().cellAt(1, 0).codepoint);
+}
+
+test "reflow retains trailing wide continuation" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 2, &dummy);
+    defer vt.deinit();
+    vt.printCodepoint('a');
+    vt.printCodepoint('b');
+    vt.printCodepoint('界');
+    try vt.resize(5, 2);
+    vt.printCodepoint('X');
+    try std.testing.expectEqual(@as(u21, 0), vt.grid().cellAt(0, 3).codepoint);
+    try std.testing.expectEqual(@as(u21, 'X'), vt.grid().cellAt(0, 4).codepoint);
+}
+
+test "osc default and palette resets preserve explicit colors" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
+    defer vt.deinit();
+    const original = vt.orig;
+    @import("osc.zig").dispatch(&vt, "\x1b]4;1;#123456\x07");
+    @import("osc.zig").dispatch(&vt, "\x1b]104\x07");
+    try std.testing.expectEqual(original.palette[1], vt.table[1]);
+    try std.testing.expectEqual(original.palette[1], vt.scheme.palette[1]);
+    vt.printCodepoint('a');
+    applyCsi(&vt, "\x1b[38;2;170;170;170;48;2;0;0;0m");
+    vt.printCodepoint('b');
+    @import("osc.zig").dispatch(&vt, "\x1b]10;#112233\x07");
+    @import("osc.zig").dispatch(&vt, "\x1b]11;#123456\x07");
+    const fg = Color{ .r = 0x11, .g = 0x22, .b = 0x33 };
+    const bg = Color{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    try std.testing.expectEqual(fg, vt.grid().cellAt(0, 0).fg);
+    try std.testing.expectEqual(bg, vt.grid().cellAt(0, 0).bg);
+    try std.testing.expectEqual(original.fg, vt.grid().cellAt(0, 1).fg);
+    try std.testing.expectEqual(original.bg, vt.grid().cellAt(0, 1).bg);
+    applyCsi(&vt, "\x1b[39;49m");
+    vt.printCodepoint('c');
+    try std.testing.expectEqual(fg, vt.grid().cellAt(0, 2).fg);
+    try std.testing.expectEqual(bg, vt.grid().cellAt(0, 2).bg);
+    @import("osc.zig").dispatch(&vt, "\x1b]110\x07");
+    @import("osc.zig").dispatch(&vt, "\x1b]111\x07");
+    try std.testing.expectEqual(original.fg, vt.grid().cellAt(0, 2).fg);
+    try std.testing.expectEqual(original.bg, vt.grid().cellAt(0, 2).bg);
+}
+
+
+test "color stack restores default cells and pens" {
+    var dummy: [1]u8 = .{0};
+    var vt = try VtState.init(std.testing.allocator, 4, 2, 2, &dummy);
+    defer vt.deinit();
+    const original = vt.scheme.bg;
+    vt.printCodepoint('a');
+    vt.xtPushColors(0);
+    @import("osc.zig").dispatch(&vt, "\x1b]11;#123456\x07");
+    vt.printCodepoint('b');
+    applyCsi(&vt, "\x1b[48;2;18;52;86m");
+    vt.printCodepoint('c');
+    vt.xtPopColors(0);
+    try std.testing.expectEqual(original, vt.scheme.bg);
+    try std.testing.expectEqual(original, vt.grid().cellAt(0, 0).bg);
+    try std.testing.expectEqual(original, vt.grid().cellAt(0, 1).bg);
+    try std.testing.expectEqual(Color{ .r = 18, .g = 52, .b = 86 }, vt.grid().cellAt(0, 2).bg);
+    applyCsi(&vt, "\x1b[49m");
+    vt.printCodepoint('d');
+    try std.testing.expectEqual(original, vt.grid().cellAt(0, 3).bg);
 }

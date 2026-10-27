@@ -406,16 +406,34 @@ fn sgr(params: []const Param, vt: *Vt) void {
             27 => g.attrs.inverse = false,
             28 => g.attrs.hidden = false,
             29 => g.attrs.strikethrough = false,
-            30...37 => g.fg = vt.colorIndex(p.value - 30),
-            39 => g.fg = vt.scheme.fg,
-            40...47 => g.bg = vt.colorIndex(p.value - 40),
-            49 => g.bg = vt.scheme.bg,
+            30...37 => {
+                g.fg = vt.colorIndex(p.value - 30);
+                g.attrs.fg_explicit = true;
+            },
+            39 => {
+                g.fg = vt.scheme.fg;
+                g.attrs.fg_explicit = false;
+            },
+            40...47 => {
+                g.bg = vt.colorIndex(p.value - 40);
+                g.attrs.bg_explicit = true;
+            },
+            49 => {
+                g.bg = vt.scheme.bg;
+                g.attrs.bg_explicit = false;
+            },
             38 => i += sgrColor(vt, params, i, .fg),
             48 => i += sgrColor(vt, params, i, .bg),
             58 => i += sgrColor(vt, params, i, .ul),
             59 => vt.clearUnderlineColor(),
-            90...97 => g.fg = vt.colorIndex(p.value - 90 + 8),
-            100...107 => g.bg = vt.colorIndex(p.value - 100 + 8),
+            90...97 => {
+                g.fg = vt.colorIndex(p.value - 90 + 8);
+                g.attrs.fg_explicit = true;
+            },
+            100...107 => {
+                g.bg = vt.colorIndex(p.value - 100 + 8);
+                g.attrs.bg_explicit = true;
+            },
             else => {},
         }
         i += 1;
@@ -480,8 +498,14 @@ fn sgrColor(vt: *Vt, params: []const Param, i: usize, target: ColorTarget) usize
 fn applyIndexed(vt: *Vt, idx: u32, target: ColorTarget) void {
     const c = vt.colorIndex(idx);
     switch (target) {
-        .fg => vt.grid().fg = c,
-        .bg => vt.grid().bg = c,
+        .fg => {
+            vt.grid().fg = c;
+            vt.grid().attrs.fg_explicit = true;
+        },
+        .bg => {
+            vt.grid().bg = c;
+            vt.grid().attrs.bg_explicit = true;
+        },
         .ul => vt.setUnderlineColor(c),
     }
 }
@@ -493,8 +517,14 @@ fn applyRgb(vt: *Vt, r: u32, g: u32, b: u32, target: ColorTarget) void {
         .b = clip(b),
     };
     switch (target) {
-        .fg => vt.grid().fg = c,
-        .bg => vt.grid().bg = c,
+        .fg => {
+            vt.grid().fg = c;
+            vt.grid().attrs.fg_explicit = true;
+        },
+        .bg => {
+            vt.grid().bg = c;
+            vt.grid().attrs.bg_explicit = true;
+        },
         .ul => vt.setUnderlineColor(c),
     }
 }

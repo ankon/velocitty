@@ -34,6 +34,7 @@ pub const Frame = struct {
     last_fill_ns: u64 = 0,
     last_glyph_ns: u64 = 0,
     prev_sel: Select.State = .{},
+    prev_graphics: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) std.mem.Allocator.Error!Frame {
         assert(width > 0);
@@ -120,8 +121,9 @@ pub const Frame = struct {
         self.dirty_y = 0;
         self.dirty_h = 0;
 
+        const graphics = screen.scrollOffset() == 0 and screen.kitty.placements.items.len != 0;
         var scroll: i2 = 0;
-        if (have_prev) {
+        if (have_prev and !graphics and !self.prev_graphics) {
             if (scrolledBy(screen, self.prev, cols, rows, 1)) {
                 scroll = 1;
             } else if (scrolledBy(screen, self.prev, cols, rows, -1)) {
@@ -147,7 +149,7 @@ pub const Frame = struct {
         const use_bits = have_prev and screen.scrollOffset() == 0 and scroll == 0;
         var paint_buf: [512]bool = @splat(false);
         const overlay_on = Debug.live and screen.debug_overlay.any();
-        const paint_all = rows > paint_buf.len or overlay_on;
+        const paint_all = rows > paint_buf.len or overlay_on or graphics or self.prev_graphics;
         var r: u16 = 0;
         while (r < rows) : (r += 1) {
             const cursor_row = mustPaintCursorRow(r, self.prev_cursor, self.prev_cursor_on, cur, cur_on) or
@@ -237,6 +239,7 @@ pub const Frame = struct {
         self.prev_cursor_on = cur_on;
         self.prev_cursor_style = style;
         self.prev_sel = sel;
+        self.prev_graphics = graphics;
         if (self.dirty_h == self.height) self.dirty_full = true;
     }
 
@@ -573,10 +576,10 @@ fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32)
     for (store.placements.items) |p| {
         if (p.screen != @as(u1, if (screen.altScreen()) 1 else 0)) continue;
         const img = store.find(p.image_id) orelse continue;
-        const dest_w: u32 = if (p.columns != 0) p.columns * cell_w else img.width;
-        const dest_h: u32 = if (p.rows != 0) p.rows * cell_h else img.height;
-        const dx: i32 = p.col * @as(i32, @intCast(cell_w));
-        const dy: i32 = p.row * @as(i32, @intCast(cell_h));
+        const dest_w: u64 = if (p.columns != 0) @as(u64, p.columns) * cell_w else img.width;
+        const dest_h: u64 = if (p.rows != 0) @as(u64, p.rows) * cell_h else img.height;
+        const dx: i64 = @as(i64, p.col) * cell_w;
+        const dy: i64 = @as(i64, p.row) * cell_h;
         const src_x = @min(p.src_x, img.width);
         const src_y = @min(p.src_y, img.height);
         const crop_w: u32 = if (p.src_w == 0) img.width - src_x else @min(p.src_w, img.width - src_x);
@@ -594,23 +597,27 @@ fn blitRgba(
     src_y: u32,
     src_w: u32,
     src_h: u32,
-    dest_x: i32,
-    dest_y: i32,
-    dest_w: u32,
-    dest_h: u32,
+    dest_x: i64,
+    dest_y: i64,
+    dest_w: u64,
+    dest_h: u64,
 ) void {
     _ = stride_h;
     if (src_w == 0 or src_h == 0 or dest_w == 0 or dest_h == 0) return;
-    var y: u32 = 0;
-    while (y < dest_h) : (y += 1) {
-        const py = dest_y + @as(i32, @intCast(y));
-        if (py < 0 or py >= self.height) continue;
-        const sy = src_y + y * src_h / dest_h;
-        var x: u32 = 0;
-        while (x < dest_w) : (x += 1) {
-            const px = dest_x + @as(i32, @intCast(x));
-            if (px < 0 or px >= self.width) continue;
-            const sx = src_x + x * src_w / dest_w;
+    // Iterate only the intersection with the framebuffer; placements may be
+    // much larger than the window or start outside it.
+    const x0: i64 = @max(0, dest_x);
+    const y0: i64 = @max(0, dest_y);
+    const x1: i64 = @intCast(@min(@as(i128, self.width), @as(i128, dest_x) + dest_w));
+    const y1: i64 = @intCast(@min(@as(i128, self.height), @as(i128, dest_y) + dest_h));
+    var py = y0;
+    while (py < y1) : (py += 1) {
+        const y: u64 = @intCast(@as(i128, py) - dest_y);
+        const sy = src_y + @as(u32, @intCast(@as(u128, y) * src_h / dest_h));
+        var px = x0;
+        while (px < x1) : (px += 1) {
+            const x: u64 = @intCast(@as(i128, px) - dest_x);
+            const sx = src_x + @as(u32, @intCast(@as(u128, x) * src_w / dest_w));
             const si = (@as(usize, sy) * stride_w + sx) * 4;
             const a = rgba[si + 3];
             if (a == 0) continue;
@@ -978,4 +985,22 @@ test "debug overlay paints grid" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "graphics repaint after deletion and clip oversized placement" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 2, 2, 8, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    var frame = try Frame.init(a, 8, 8);
+    defer frame.deinit();
+    _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=4,C=1,c=1073741824,r=1;/wAA/w==\x1b\\", .{}, 2, 2, 0);
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), frame.pixels[0]);
+    vt.clearDirty();
+    _ = vt.kitty.feed("\x1b_Ga=d,d=a,q=2\x1b\\", .{}, 2, 2, 0);
+    vt.markDirtyAll();
+    frame.render(&vt, 4, 4, null, 8);
+    try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
 }

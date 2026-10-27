@@ -1224,12 +1224,13 @@ peak_platform_epoll(PeakWindowInternal *intern, PeakEvent *ev)
 			/* DEL is tty erase, not forward delete. Do not emit it as text. */
 			if (xev.type == KeyPress && n > 0 && (unsigned char)buf[0] >= 32
 				&& (unsigned char)buf[0] != 0x7f
-				&& ev->key.key != PEAK_KEY_DELETE && ev->key.key != PEAK_KEY_BACKSPACE) {
-				peak_text_store(buf, (size_t)n);
+				&& ev->key.key != PEAK_KEY_DELETE && ev->key.key != PEAK_KEY_BACKSPACE
+				&& !((ev->key.mod & (PEAK_KEYMOD_CTRL | PEAK_KEYMOD_ALT | PEAK_KEYMOD_SUPER)) && n == 1 && (unsigned char)buf[0] < 128)) {
 				w->extra_on = 1;
 				memset(&w->extra, 0, sizeof w->extra);
 				w->extra.type = PEAK_EVENT_TEXT;
 				w->extra.text.n = (size_t)n;
+				memcpy(w->extra.text.bytes, buf, (size_t)n);
 			}
 			return 1;
 		}

@@ -12,14 +12,14 @@ pub const Color = packed struct {
 };
 
 pub const vga_palette = [_]Color{
-    .{ .r = 0, .g = 0, .b = 0 },       .{ .r = 170, .g = 0, .b = 0 },
-    .{ .r = 0, .g = 170, .b = 0 },     .{ .r = 170, .g = 85, .b = 0 },
-    .{ .r = 0, .g = 0, .b = 170 },     .{ .r = 170, .g = 0, .b = 170 },
-    .{ .r = 0, .g = 170, .b = 170 },   .{ .r = 170, .g = 170, .b = 170 },
-    .{ .r = 85, .g = 85, .b = 85 },    .{ .r = 255, .g = 85, .b = 85 },
-    .{ .r = 85, .g = 255, .b = 85 },   .{ .r = 255, .g = 255, .b = 85 },
-    .{ .r = 85, .g = 85, .b = 255 },   .{ .r = 255, .g = 85, .b = 255 },
-    .{ .r = 85, .g = 255, .b = 255 },  .{ .r = 255, .g = 255, .b = 255 },
+    .{ .r = 0, .g = 0, .b = 0 },      .{ .r = 170, .g = 0, .b = 0 },
+    .{ .r = 0, .g = 170, .b = 0 },    .{ .r = 170, .g = 85, .b = 0 },
+    .{ .r = 0, .g = 0, .b = 170 },    .{ .r = 170, .g = 0, .b = 170 },
+    .{ .r = 0, .g = 170, .b = 170 },  .{ .r = 170, .g = 170, .b = 170 },
+    .{ .r = 85, .g = 85, .b = 85 },   .{ .r = 255, .g = 85, .b = 85 },
+    .{ .r = 85, .g = 255, .b = 85 },  .{ .r = 255, .g = 255, .b = 85 },
+    .{ .r = 85, .g = 85, .b = 255 },  .{ .r = 255, .g = 85, .b = 255 },
+    .{ .r = 85, .g = 255, .b = 255 }, .{ .r = 255, .g = 255, .b = 255 },
 };
 
 pub const Scheme = struct {
@@ -43,7 +43,9 @@ pub const Attrs = packed struct {
     ul_color: bool = false,
     /// 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed (foot SGR 4:n).
     underline_style: u3 = 0,
-    _padding: u3 = 0,
+    fg_explicit: bool = false,
+    bg_explicit: bool = false,
+    _padding: u1 = 0,
 };
 
 pub const Rgb = packed struct {
@@ -159,7 +161,7 @@ pub const Grid = struct {
 
         const new_cells = try allocator.alloc(Cell, @as(usize, new_cols) * new_cap);
         errdefer allocator.free(new_cells);
-        const blank = Cell{ .fg = self.fg, .bg = self.bg, .codepoint = ' ' };
+        const blank = self.blankCell();
         @memset(new_cells, blank);
 
         const new_starts = try allocator.alloc(u32, new_cap);
@@ -209,7 +211,7 @@ pub const Grid = struct {
         const hist = self.used -| @as(u32, old_rows);
         const old_total = hist + @as(u32, old_rows);
         const oldest = (self.head + self.cap - hist) % self.cap;
-        const blank = Cell{ .fg = self.fg, .bg = self.bg, .codepoint = ' ' };
+        const blank = self.blankCell();
         const cur_abs = hist + @as(u32, self.cursor.row);
         const cur_col = self.cursor.col;
 
@@ -223,6 +225,7 @@ pub const Grid = struct {
         var new_cur_row: u32 = 0;
         var new_cur_col: u16 = @min(cur_col, new_cols - 1);
         var mapped_cursor = false;
+        var new_wrap_pending = false;
 
         var i: u32 = 0;
         while (i < old_total) {
@@ -256,7 +259,13 @@ pub const Grid = struct {
                     cur_abs,
                     cur_col,
                 );
-                mapCursor(offset, new_cols, before_rows, &new_cur_row, &new_cur_col);
+                const insertion_offset = offset + @intFromBool(self.wrap_pending);
+                if (self.wrap_pending and insertion_offset % new_cols == 0) {
+                    mapCursor(insertion_offset - 1, new_cols, before_rows, &new_cur_row, &new_cur_col);
+                    new_wrap_pending = true;
+                } else {
+                    mapCursor(insertion_offset, new_cols, before_rows, &new_cur_row, &new_cur_col);
+                }
                 mapped_cursor = true;
             }
             i += 1;
@@ -334,7 +343,7 @@ pub const Grid = struct {
             self.cursor.row = @min(self.cursor.row, new_rows - 1);
             self.cursor.col = @min(self.cursor.col, new_cols - 1);
         }
-        self.wrap_pending = false;
+        self.wrap_pending = new_wrap_pending;
         self.saved_cursor.row = @min(self.saved_cursor.row, new_rows - 1);
         self.saved_cursor.col = @min(self.saved_cursor.col, new_cols - 1);
         self.saved_wrap_pending = false;
@@ -445,7 +454,7 @@ pub const Grid = struct {
     pub inline fn blankCell(self: *Grid) Cell {
         return Cell{
             .codepoint = ' ',
-            .attrs = .{},
+            .attrs = .{ .fg_explicit = self.attrs.fg_explicit, .bg_explicit = self.attrs.bg_explicit },
             .fg = self.fg,
             .bg = self.bg,
         };
@@ -510,7 +519,7 @@ pub const Grid = struct {
     pub fn scrollUp(self: *Grid, top: u16, bottom: u16, n: u16, cols: u16) void {
         const count = @min(n, bottom - top + 1);
         var i: u16 = top;
-        while (i <= bottom - count) : (i += 1) {
+        while (@as(u32, i) + count <= bottom) : (i += 1) {
             const src_idx = (self.head + i + count) % self.cap;
             const dst_idx = (self.head + i) % self.cap;
             std.mem.copyForwards(
@@ -520,7 +529,7 @@ pub const Grid = struct {
             );
             self.wraps[dst_idx] = self.wraps[src_idx];
         }
-        var clear_row: u16 = bottom - count + 1;
+        var clear_row: u16 = @intCast(@as(u32, bottom) + 1 - count);
         while (clear_row <= bottom) : (clear_row += 1) {
             self.clearRange(clear_row, 0, cols);
             self.setRowWrap(clear_row, false);
@@ -569,6 +578,7 @@ fn rowContentLen(row: []const Cell) u16 {
     var n: u16 = @intCast(row.len);
     while (n > 0) {
         const cp = row[n - 1].codepoint;
+        if (cp == 0 and n >= 2 and row[n - 2].codepoint != 0 and row[n - 2].codepoint != ' ') break;
         if (cp != 0 and cp != ' ') break;
         n -= 1;
     }

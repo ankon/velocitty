@@ -197,6 +197,10 @@ pub const Pty = struct {
         self.impl.write(bytes);
     }
 
+    pub fn flush(self: *Pty) void {
+        self.impl.flush();
+    }
+
     pub fn read(self: *Pty, buf: []u8) error{Hangup}![]u8 {
         return self.impl.read(buf);
     }
@@ -332,8 +336,12 @@ const PeakWindow = struct {
                         return true;
                     }
                     if (k.mod.ctrl or k.mod.alt or k.mod.super) {
-                        if (letterKey(k.key)) |key| {
-                            ev.* = .{ .key_press = .{ .key = key, .mods = modsOf(k.mod), .cp = cpOf(k.key) } };
+                        // Peak's code is the layout-produced byte, including
+                        // C0 bytes for Control punctuation. Multibyte compose
+                        // remains on the text path.
+                        if ((k.code > 0 and k.code < 128) or (k.mod.ctrl and k.key == .space)) {
+                            const cp: u21 = @intCast(if (k.code == 0) 32 else if (k.code < 32 and k.mod.ctrl) k.code + 64 else k.code);
+                            ev.* = .{ .key_press = .{ .key = letterKey(k.key) orelse .unknown, .mods = modsOf(k.mod), .cp = cp } };
                             return true;
                         }
                         continue;
@@ -426,6 +434,8 @@ const PeakWindow = struct {
 
 const PeakPty = struct {
     proc: peak.Proc = .{ .fd = peak.handle_invalid, .pid = 0 },
+    pending: std.ArrayList(u8) = .empty,
+    pending_offset: usize = 0,
 
     pub fn open(self: *PeakPty, dims: Dimensions, spawn: Spawn) !void {
         var argv_buf: [65]?[*:0]const u8 = undefined;
@@ -453,11 +463,14 @@ const PeakPty = struct {
         pushChildEnv(dims);
         defer popChildEnv();
 
+        self.pending = .empty;
+        self.pending_offset = 0;
         self.proc = peak.ptySpawn(std.mem.span(file), @ptrCast(&argv_buf), dims.cols, dims.rows, dims.px_w, dims.px_h) orelse return error.OpenPty;
     }
 
     pub fn close(self: *PeakPty) void {
         peak.ptyClose(&self.proc);
+        self.pending.deinit(std.heap.page_allocator);
     }
 
     pub fn fd(self: *const PeakPty) std.posix.fd_t {
@@ -465,16 +478,36 @@ const PeakPty = struct {
     }
 
     pub fn write(self: *PeakPty, bytes: []const u8) void {
-        var off: usize = 0;
-        while (off < bytes.len) {
-            switch (peak.fdWrite(self.proc.fd, bytes[off..])) {
+        if (bytes.len == 0) return;
+        // Compact consumed bytes before appending, preserving the order of all
+        // keyboard, paste, and terminal reply writes across short writes.
+        if (self.pending_offset != 0) {
+            const remaining = self.pending.items.len - self.pending_offset;
+            std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[self.pending_offset..]);
+            self.pending.items.len = remaining;
+            self.pending_offset = 0;
+        }
+        self.pending.appendSlice(std.heap.page_allocator, bytes) catch @panic("PTY input queue allocation failed");
+        self.flush();
+    }
+
+    pub fn flush(self: *PeakPty) void {
+        while (self.pending_offset < self.pending.items.len) {
+            switch (peak.fdWrite(self.proc.fd, self.pending.items[self.pending_offset..])) {
                 .n => |n| {
                     if (n == 0) return;
-                    off += n;
+                    self.pending_offset += n;
                 },
-                .would_block, .eof => return,
+                .would_block => return,
+                .eof => {
+                    self.pending.clearRetainingCapacity();
+                    self.pending_offset = 0;
+                    return;
+                },
             }
         }
+        self.pending.clearRetainingCapacity();
+        self.pending_offset = 0;
     }
 
     pub fn read(self: *PeakPty, buf: []u8) error{Hangup}![]u8 {
