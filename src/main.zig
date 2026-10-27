@@ -49,7 +49,20 @@ const fallback_paths: []const []const u8 = switch (builtin.os.tag) {
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/gnu-free/FreeSans.otf",
         "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     },
+};
+
+// Resolve standard coverage fonts even when the distribution uses other paths.
+const fallback_families: []const []const u8 = &.{
+    "Noto Sans Symbols",
+    "Noto Sans Symbols 2",
+    "Noto Sans CJK JP",
+    "Noto Color Emoji",
 };
 
 const FontBlob = struct {
@@ -68,10 +81,27 @@ fn loadFontPath(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return bytes;
 }
 
-fn resolveFamilyFile(io: std.Io, gpa: std.mem.Allocator, family: []const u8) ?[]u8 {
+fn fontMatchPath(output: []const u8, required_family: ?[]const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const path = std.mem.trim(u8, lines.next() orelse return null, " \t\r");
+    if (path.len == 0 or path[0] != '/') return null;
+    if (required_family) |family| {
+        // fc-match succeeds even for nonexistent families. Never silently add
+        // its unrelated default face as a requested fallback.
+        const matched = lines.next() orelse return null;
+        var names = std.mem.splitScalar(u8, matched, ',');
+        while (names.next()) |name| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, name, " \t\r"), family)) return path;
+        }
+        return null;
+    }
+    return path;
+}
+
+fn resolveFamilyFile(io: std.Io, gpa: std.mem.Allocator, family: []const u8, exact: bool) ?[]u8 {
     // fontconfig reads HOME / FONTCONFIG_* from the child environment.
     const result = std.process.run(gpa, io, .{
-        .argv = &.{ "fc-match", "-f", "%{file}", family },
+        .argv = &.{ "fc-match", "-f", "%{file}\n%{family}\n", family },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
     }) catch return null;
@@ -81,14 +111,15 @@ fn resolveFamilyFile(io: std.Io, gpa: std.mem.Allocator, family: []const u8) ?[]
         .exited => |code| if (code != 0) return null,
         else => return null,
     }
-    const path = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (path.len == 0 or path[0] != '/') return null;
+    const path = fontMatchPath(result.stdout, if (exact) family else null) orelse return null;
     return gpa.dupe(u8, path) catch null;
 }
 
-fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), family: ?[]const u8) !void {
-    var seen: [16][std.fs.max_path_bytes]u8 = undefined;
-    var seen_len: [16]usize = @splat(0);
+fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), config: *const Scheme.Config) !void {
+    // Four styled primary faces, emergency primary, custom families, defaults.
+    const max_paths = 5 + Scheme.max_font_fallbacks + fallback_paths.len + fallback_families.len;
+    var seen: [max_paths][std.fs.max_path_bytes]u8 = undefined;
+    var seen_len: [max_paths]usize = @splat(0);
     var seen_n: usize = 0;
 
     const already = struct {
@@ -140,28 +171,29 @@ fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), 
             gpa_: std.mem.Allocator,
             out_: *std.ArrayList(FontBlob),
             pattern: []const u8,
+            exact: bool,
             style: @import("type.zig").Style,
             seen_buf: [][std.fs.max_path_bytes]u8,
             seen_l: []usize,
             n: *usize,
         ) void {
-            const path = resolveFamilyFile(io_, gpa_, pattern) orelse return;
+            const path = resolveFamilyFile(io_, gpa_, pattern, exact) orelse return;
             defer gpa_.free(path);
             _ = append_path(io_, gpa_, out_, path, style, seen_buf, seen_l, n);
         }
     }.go;
 
-    const fam = family orelse "monospace";
-    try_pattern(io, gpa, out, fam, .{}, &seen, seen_len[0..], &seen_n);
+    const fam = config.family() orelse "monospace";
+    try_pattern(io, gpa, out, fam, false, .{}, &seen, seen_len[0..], &seen_n);
     var pat_buf: [192]u8 = undefined;
     if (std.fmt.bufPrint(&pat_buf, "{s}:weight=bold", .{fam})) |p| {
-        try_pattern(io, gpa, out, p, .{ .bold = true }, &seen, seen_len[0..], &seen_n);
+        try_pattern(io, gpa, out, p, false, .{ .bold = true }, &seen, seen_len[0..], &seen_n);
     } else |_| {}
     if (std.fmt.bufPrint(&pat_buf, "{s}:slant=italic", .{fam})) |p| {
-        try_pattern(io, gpa, out, p, .{ .italic = true }, &seen, seen_len[0..], &seen_n);
+        try_pattern(io, gpa, out, p, false, .{ .italic = true }, &seen, seen_len[0..], &seen_n);
     } else |_| {}
     if (std.fmt.bufPrint(&pat_buf, "{s}:weight=bold:slant=italic", .{fam})) |p| {
-        try_pattern(io, gpa, out, p, .{ .bold = true, .italic = true }, &seen, seen_len[0..], &seen_n);
+        try_pattern(io, gpa, out, p, false, .{ .bold = true, .italic = true }, &seen, seen_len[0..], &seen_n);
     } else |_| {}
 
     if (out.items.len == 0) {
@@ -169,10 +201,17 @@ fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), 
             if (append_path(io, gpa, out, path, .{}, &seen, seen_len[0..], &seen_n)) break;
         }
     }
+    // Keep the configured primary/style faces; user fallbacks take priority
+    // over the built-in coverage fonts, in the order written in config.toml.
+    for (config.fallbackFamilies()) |*name| {
+        try_pattern(io, gpa, out, name.slice(), true, .{}, &seen, seen_len[0..], &seen_n);
+    }
     for (fallback_paths) |path| {
         _ = append_path(io, gpa, out, path, .{}, &seen, seen_len[0..], &seen_n);
     }
-    try_pattern(io, gpa, out, "Noto Color Emoji", .{}, &seen, seen_len[0..], &seen_n);
+    for (fallback_families) |name| {
+        try_pattern(io, gpa, out, name, true, .{}, &seen, seen_len[0..], &seen_n);
+    }
     if (out.items.len == 0) return error.InvalidFont;
 }
 
@@ -658,7 +697,6 @@ fn encodeMouse(
     return buf[0..6];
 }
 
-
 fn textLen(text: [64]u8) usize {
     return std.mem.indexOfScalar(u8, &text, 0) orelse text.len;
 }
@@ -702,7 +740,6 @@ const EventLoop = struct {
 
     fn dispatch(self: *EventLoop, ev: Platform.Event) void {
         switch (ev) {
-
             .quit => self.running.* = false,
             .resize => {
                 self.clearSel();
@@ -1058,7 +1095,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     var type_ptr: ?*TypeCtx = null;
-    if (loadFonts(io.io(), allocator, &font_blobs, config.family())) |_| {
+    if (loadFonts(io.io(), allocator, &font_blobs, &config)) |_| {
         bindFonts(allocator, &type_ctx, font_blobs.items) catch {};
         cellMetrics(&type_ctx, size_px, &cell_w, &cell_h);
         type_ptr = &type_ctx;
@@ -1140,7 +1177,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             term.applyScheme(config.scheme);
 
             var new_blobs: std.ArrayList(FontBlob) = .empty;
-            if (loadFonts(io.io(), allocator, &new_blobs, config.family())) |_| {
+            if (loadFonts(io.io(), allocator, &new_blobs, &config)) |_| {
                 if (bindFonts(allocator, &type_ctx, new_blobs.items)) |_| {
                     for (font_blobs.items) |b| allocator.free(b.bytes);
                     font_blobs.deinit(allocator);
@@ -1245,6 +1282,74 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
+test "fontconfig fallbacks require an installed family, not a substitute" {
+    const output = "/fonts/Example.ttf\nExample Sans,Example Sans Regular\n";
+    try std.testing.expectEqualStrings("/fonts/Example.ttf", fontMatchPath(output, "Example Sans").?);
+    try std.testing.expectEqualStrings("/fonts/Example.ttf", fontMatchPath(output, "example sans regular").?);
+    try std.testing.expect(fontMatchPath(output, "Missing Font") == null);
+    try std.testing.expect(fontMatchPath(output, "Example") == null);
+    // Primary fontconfig patterns and generic aliases still allow substitution.
+    try std.testing.expectEqualStrings("/fonts/Example.ttf", fontMatchPath(output, null).?);
+    try std.testing.expect(fontMatchPath("", null) == null);
+    try std.testing.expect(fontMatchPath("relative.ttf\nExample Sans\n", "Example Sans") == null);
+    try std.testing.expect(fontMatchPath("/fonts/Example.ttf\n", "Example Sans") == null);
+}
+
+test "configured font fallbacks load in order and keep the primary font" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = std.testing.environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const families = [_][]const u8{ "monospace", "Noto Sans Symbols 2", "Noto Sans Symbols" };
+    var expected: [families.len][]u8 = undefined;
+    var loaded: usize = 0;
+    defer for (expected[0..loaded]) |bytes| gpa.free(bytes);
+    for (families, 0..) |name, i| {
+        const path = resolveFamilyFile(io, gpa, name, i != 0) orelse return error.SkipZigTest;
+        defer gpa.free(path);
+        expected[i] = loadFontPath(io, gpa, path) catch return error.SkipZigTest;
+        loaded += 1;
+    }
+    // Exercise both initial configuration and a reordered list, as on reload.
+    for ([_][]const u8{
+        "['Noto Sans Symbols 2', 'Velocitty Missing Test Font', 'Noto Sans Symbols', 'Noto Sans Symbols 2']",
+        "['Noto Sans Symbols', 'Noto Sans Symbols 2', 'Noto Sans Symbols']",
+    }, 0..) |list, round| {
+        const src = try std.fmt.allocPrint(gpa, "[font]\nfamily = 'monospace'\nfallbacks = {s}\n", .{list});
+        defer gpa.free(src);
+        const config = try Scheme.parse(src);
+        var blobs: std.ArrayList(FontBlob) = .empty;
+        defer {
+            for (blobs.items) |blob| gpa.free(blob.bytes);
+            blobs.deinit(gpa);
+        }
+        try loadFonts(io, gpa, &blobs, &config);
+        var regular: usize = 0;
+        var first_fallback_count: usize = 0;
+        for (blobs.items) |blob| {
+            if (blob.style.bold or blob.style.italic) continue;
+            if (regular < expected.len) {
+                const index = if (regular == 0 or round == 0) regular else 3 - regular;
+                try std.testing.expectEqualSlices(u8, expected[index], blob.bytes);
+            }
+            if (std.mem.eql(u8, expected[1], blob.bytes)) first_fallback_count += 1;
+            regular += 1;
+        }
+        try std.testing.expect(regular >= expected.len);
+        try std.testing.expectEqual(@as(usize, 1), first_fallback_count);
+        var ctx = try TypeCtx.init(gpa, .{});
+        defer ctx.deinit();
+        try bindFonts(gpa, &ctx, blobs.items);
+        const ascii = try ctx.glyph('A', 16);
+        try std.testing.expectEqual(ctx.primary.?, ascii.font_id);
+        try std.testing.expect(ascii.glyph_id != 0);
+        for ([_]u21{ 0x25B0, 0x25B1, 0x280B }) |cp| {
+            const glyph = try ctx.glyph(cp, 16);
+            try std.testing.expect(glyph.glyph_id != 0);
+        }
+    }
+}
+
 test "multi-click sequences stop at focus changes" {
     // Only the mouse bookkeeping is used; no window or PTY is needed.
     var a: EventLoop = undefined;
@@ -1268,4 +1373,3 @@ test "multi-click sequences stop at focus changes" {
     try std.testing.expectEqual(Select.Kind.cell, a.clickKind(p, 400));
     try std.testing.expectEqual(Select.Kind.cell, a.clickKind(p, 900));
 }
-

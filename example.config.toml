@@ -30,4 +30,7 @@ pad = 14
 
 [font]
 family = "monospace"
+# Extra installed families, in order, before built-in DejaVu/Noto fallbacks.
+# fallbacks = ["Symbols Nerd Font Mono"]
+fallbacks = []
 size = 16

@@ -32,6 +32,7 @@
 //!
 //! [font]
 //! family = "monospace"
+//! fallbacks = ["Noto Sans Symbols 2", "Noto Color Emoji"]
 //! size = 16
 //! ```
 //!
@@ -54,6 +55,16 @@ const Grid = @import("grid.zig");
 pub const Scheme = Grid.Scheme;
 
 pub const max_font_family = 128;
+pub const max_font_fallbacks = 16;
+
+pub const FontFamily = struct {
+    name: [max_font_family]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub fn slice(self: *const FontFamily) []const u8 {
+        return self.name[0..self.len];
+    }
+};
 
 pub const Config = struct {
     scheme: Scheme = .{},
@@ -64,12 +75,19 @@ pub const Config = struct {
     pad_px: u32 = 14,
     font_family: [max_font_family]u8 = @splat(0),
     font_family_len: u8 = 0,
+    /// Ordered installed families, before built-in fallbacks. Empty keeps defaults.
+    font_fallbacks: [max_font_fallbacks]FontFamily = @splat(.{}),
+    font_fallbacks_len: u8 = 0,
     /// Point size (Alacritty/Foot/Ghostty). 0 = unspecified (caller default).
     font_size: f32 = 0,
 
     pub fn family(self: *const Config) ?[]const u8 {
         if (self.font_family_len == 0) return null;
         return self.font_family[0..self.font_family_len];
+    }
+
+    pub fn fallbackFamilies(self: *const Config) []const FontFamily {
+        return self.font_fallbacks[0..self.font_fallbacks_len];
     }
 };
 
@@ -265,6 +283,8 @@ const Parser = struct {
         } else if (settings and isFontFamilyKey(key)) {
             const value = try self.parseString();
             setFamily(config, value);
+        } else if (font_table and std.mem.eql(u8, key, "fallbacks")) {
+            try self.parseFontFallbacks(config);
         } else if (font_table and self.i < self.src.len and self.src[self.i] == '{') {
             try self.parseFontInline(config);
         } else if (self.i < self.src.len and (self.src[self.i] == '"' or self.src[self.i] == '\'')) {
@@ -287,6 +307,37 @@ const Parser = struct {
             _ = try self.parseBare();
         }
         return self.src[start..self.i];
+    }
+
+    fn parseFontFallbacks(self: *Parser, config: *Config) error{InvalidToml}!void {
+        if (self.i >= self.src.len or self.src[self.i] != '[') return error.InvalidToml;
+        self.i += 1;
+        config.font_fallbacks_len = 0;
+        self.skipSpaceComments();
+        while (true) {
+            if (self.i >= self.src.len) return error.InvalidToml;
+            if (self.src[self.i] == ']') {
+                self.i += 1;
+                return;
+            }
+            const value = try self.parseString();
+            if (std.mem.trim(u8, value, " \t").len == 0 or value.len > max_font_family or
+                std.mem.indexOfScalar(u8, value, 0) != null or
+                config.font_fallbacks_len == max_font_fallbacks) return error.InvalidToml;
+            const entry = &config.font_fallbacks[config.font_fallbacks_len];
+            @memcpy(entry.name[0..value.len], value);
+            entry.len = @intCast(value.len);
+            config.font_fallbacks_len += 1;
+            self.skipSpaceComments();
+            if (self.i >= self.src.len) return error.InvalidToml;
+            if (self.src[self.i] == ']') {
+                self.i += 1;
+                return;
+            }
+            if (self.src[self.i] != ',') return error.InvalidToml;
+            self.i += 1;
+            self.skipSpaceComments();
+        }
     }
 
     fn parseFontInline(self: *Parser, config: *Config) error{InvalidToml}!void {
@@ -720,6 +771,69 @@ test "font table" {
     );
     try std.testing.expectEqualStrings("Terminess Nerd Font Mono", cfg.family().?);
     try std.testing.expectEqual(@as(f32, 8.5), cfg.font_size);
+}
+
+test "font fallbacks preserve order and own their names" {
+    var src = ("[font]\n" ++
+        "family = 'Primary'\n" ++
+        "fallbacks = [\n" ++
+        "  'Symbols', # first choice\n" ++
+        "  \"Emoji\",\n" ++
+        "]\n").*;
+    const cfg = try parse(&src);
+    @memset(&src, 0);
+    try std.testing.expectEqualStrings("Primary", cfg.family().?);
+    const names = cfg.fallbackFamilies();
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("Symbols", names[0].slice());
+    try std.testing.expectEqualStrings("Emoji", names[1].slice());
+}
+
+test "font fallback overlays replace or clear only when specified" {
+    const base = try parse("[font]\nfallbacks = ['First', 'Second']\n");
+    const kept = try parseInto("[font]\nsize = 12\n", base);
+    try std.testing.expectEqualStrings("Second", kept.fallbackFamilies()[1].slice());
+    const replaced = try parseInto("[fonts]\nfallbacks = ['Other']\n", kept);
+    try std.testing.expectEqual(@as(usize, 1), replaced.fallbackFamilies().len);
+    try std.testing.expectEqualStrings("Other", replaced.fallbackFamilies()[0].slice());
+    const cleared = try parseInto("[font]\nfallbacks = []\n", replaced);
+    try std.testing.expectEqual(@as(usize, 0), cleared.fallbackFamilies().len);
+    const unrelated = try parseInto("[other]\nfallbacks = ['Ignored']\n", base);
+    try std.testing.expectEqual(@as(usize, 2), unrelated.fallbackFamilies().len);
+}
+
+test "font fallback arrays reject invalid entries and delimiters" {
+    for ([_][]const u8{
+        "'not an array'", "[1]",                "['']",        "['   ']",     "['nul\x00name']",
+        "[['Nested']]",   "['First' 'Second']", "['First',,]", "[, 'First']", "['First'",
+    }) |value| {
+        const src = try std.fmt.allocPrint(std.testing.allocator, "[font]\nfallbacks = {s}\n", .{value});
+        defer std.testing.allocator.free(src);
+        try std.testing.expectError(error.InvalidToml, parse(src));
+    }
+}
+
+test "font fallback limits are checked without truncation" {
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(std.testing.allocator);
+    try src.appendSlice(std.testing.allocator, "[font]\nfallbacks = [");
+    for (0..max_font_fallbacks) |_| {
+        try src.append(std.testing.allocator, '\'');
+        try src.appendNTimes(std.testing.allocator, 'a', max_font_family);
+        try src.appendSlice(std.testing.allocator, "',");
+    }
+    try src.append(std.testing.allocator, ']');
+    const cfg = try parse(src.items);
+    try std.testing.expectEqual(@as(usize, max_font_fallbacks), cfg.fallbackFamilies().len);
+    try std.testing.expectEqual(@as(usize, max_font_family), cfg.fallbackFamilies()[0].slice().len);
+    src.items.len -= 1;
+    try src.appendSlice(std.testing.allocator, "'Extra']");
+    try std.testing.expectError(error.InvalidToml, parse(src.items));
+    src.clearRetainingCapacity();
+    try src.appendSlice(std.testing.allocator, "[font]\nfallbacks = ['");
+    try src.appendNTimes(std.testing.allocator, 'a', max_font_family + 1);
+    try src.appendSlice(std.testing.allocator, "']");
+    try std.testing.expectError(error.InvalidToml, parse(src.items));
 }
 
 test "alacritty font inline" {

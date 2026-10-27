@@ -152,6 +152,21 @@ output scale factor.
 Fontconfig family name. Default: fontconfig
 .BR monospace .
 .TP
+.B fallbacks
+Array of installed font family names, in priority order, after the primary
+and styled faces and before built-in coverage fonts. For example:
+.nf
+fallbacks = ["Symbols Nerd Font Mono", "Noto Sans Symbols 2"]
+.fi
+Missing families and duplicate font files are skipped; names must match an
+installed family (case-insensitive), not a fontconfig pattern or generic alias.
+Built-in DejaVu and Noto symbol, CJK, and color emoji fallbacks remain enabled,
+including when this array is empty (the default). The renderer retains its
+color-emoji preference. Fonts must already be installed.
+Maximum: 16 names, 128 bytes per name. A later config array replaces the
+previous array; an empty array clears only the user list. Reload with
+SIGUSR1 or SIGUSR2, or let the config watcher detect the change.
+.TP
 .BR size " / " font_size
 Point size. Default: Alacritty config, else 9 under Omarchy, else the
 built-in fallback fonts.
@@ -180,6 +195,7 @@ pad = 14
 
 [font]
 family = "monospace"
+fallbacks = []
 size = 16
 .RE
 .fi
