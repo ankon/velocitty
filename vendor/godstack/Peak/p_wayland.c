@@ -128,6 +128,8 @@ struct peak_wayland_win {
 	void *shm;
 	size_t shm_n;
 	struct wl_buffer *wl_buf;
+	/* shm does not hold the last present (new buffer or opacity change). */
+	int shm_stale;
 	int configured;
 	int flags;
 	int cursor_on;
@@ -304,6 +306,7 @@ static PeakWindowInternal peak_wayland_window_open(const char *name, uint32_t wi
 static void peak_wayland_window_close(PeakWindowInternal *intern);
 static uint32_t *peak_wayland_window_buffer(PeakWindowInternal *intern, size_t *width, size_t *height);
 static void peak_wayland_window_present(PeakWindowInternal *intern);
+static void peak_wayland_window_present_rect(PeakWindowInternal *intern, uint32_t y, uint32_t h);
 static void peak_wayland_window_set_title(PeakWindowInternal *intern, const char *name);
 static void peak_wayland_window_set_class(PeakWindowInternal *intern, const char *name);
 static void peak_wayland_window_set_size(PeakWindowInternal *intern, uint32_t width, uint32_t height);
@@ -2031,6 +2034,7 @@ peak_wayland_shm_resize(struct peak_wayland_win *w, uint32_t width, uint32_t hei
 		return 0;
 	}
 	w->shm_n = n;
+	w->shm_stale = 1;
 	memset(args, 0, sizeof args);
 	args[1].h = w->shm_fd;
 	args[2].i = (int32_t)n;
@@ -2352,26 +2356,39 @@ peak_wayland_window_buffer(PeakWindowInternal *intern, size_t *width, size_t *he
 	return w->buffer;
 }
 
+/* Copy rows [y, y+h) to shm and damage only them (whole surface when the
+   shm is stale or wl_surface < 4 lacks damage_buffer). */
 static void
-peak_wayland_window_present(PeakWindowInternal *intern)
+peak_wayland_present_rows(struct peak_wayland_win *w, uint32_t y, uint32_t h)
 {
-	struct peak_wayland_win *w;
 	union wl_argument args[4];
+	size_t row_n, off, n;
+	int full;
 
-	w = intern ? intern->w : NULL;
-	if (!w || !w->surface || !w->wl_buf || !w->buffer || !w->shm)
+	full = w->shm_stale || w->attached_w != w->width || w->attached_h != w->height;
+	if (full || y >= w->height) {
+		y = 0;
+		h = w->height;
+	}
+	if (h > w->height - y)
+		h = w->height - y;
+	row_n = (size_t)w->width * 4;
+	off = (size_t)y * row_n;
+	n = (size_t)h * row_n;
+	if (off > w->shm_n)
 		return;
-	peak_wayland_bind_geom(w);
-	memcpy(w->shm, w->buffer, w->shm_n);
+	if (n > w->shm_n - off)
+		n = w->shm_n - off;
+	memcpy((char *)w->shm + off, (char *)w->buffer + off, n);
 	if (!w->alpha && w->opacity < 255) {
 		uint32_t *px;
-		size_t i, n;
+		size_t i, cnt;
 		uint32_t a;
 
-		px = w->shm;
-		n = w->shm_n / 4;
+		px = (uint32_t *)((char *)w->shm + off);
+		cnt = n / 4;
 		a = w->opacity;
-		for (i = 0; i < n; i++) {
+		for (i = 0; i < cnt; i++) {
 			uint32_t c, pa;
 
 			c = px[i];
@@ -2379,19 +2396,55 @@ peak_wayland_window_present(PeakWindowInternal *intern)
 			px[i] = (c & 0x00ffffffu) | (pa << 24);
 		}
 	}
+	w->shm_stale = 0;
 	args[0].o = (struct wl_object *)w->wl_buf;
 	args[1].i = 0;
 	args[2].i = 0;
 	peak_wayland_marshal((struct wl_proxy *)w->surface, 1, NULL, args);
-	args[0].i = 0;
-	args[1].i = 0;
-	args[2].i = (int32_t)(w->logical_w ? w->logical_w : w->width);
-	args[3].i = (int32_t)(w->logical_h ? w->logical_h : w->height);
-	peak_wayland_marshal((struct wl_proxy *)w->surface, 2, NULL, args);
+	if (!full && peak_wl.wl_proxy_get_version((struct wl_proxy *)w->surface) >= 4) {
+		args[0].i = 0;
+		args[1].i = (int32_t)y;
+		args[2].i = (int32_t)w->width;
+		args[3].i = (int32_t)h;
+		peak_wayland_marshal((struct wl_proxy *)w->surface, 9, NULL, args);
+	} else {
+		args[0].i = 0;
+		args[1].i = 0;
+		args[2].i = (int32_t)(w->logical_w ? w->logical_w : w->width);
+		args[3].i = (int32_t)(w->logical_h ? w->logical_h : w->height);
+		peak_wayland_marshal((struct wl_proxy *)w->surface, 2, NULL, args);
+	}
 	peak_wayland_marshal((struct wl_proxy *)w->surface, 6, NULL, NULL);
 	w->attached_w = w->width;
 	w->attached_h = w->height;
 	peak_wl.wl_display_flush(peak_wayland.display);
+}
+
+static void
+peak_wayland_window_present(PeakWindowInternal *intern)
+{
+	struct peak_wayland_win *w;
+
+	w = intern ? intern->w : NULL;
+	if (!w || !w->surface || !w->wl_buf || !w->buffer || !w->shm)
+		return;
+	peak_wayland_bind_geom(w);
+	w->shm_stale = 1;
+	peak_wayland_present_rows(w, 0, w->height);
+}
+
+static void
+peak_wayland_window_present_rect(PeakWindowInternal *intern, uint32_t y, uint32_t h)
+{
+	struct peak_wayland_win *w;
+
+	w = intern ? intern->w : NULL;
+	if (!w || !w->surface || !w->wl_buf || !w->buffer || !w->shm)
+		return;
+	peak_wayland_bind_geom(w);
+	if (h == 0 && !w->shm_stale)
+		return;
+	peak_wayland_present_rows(w, y, h);
 }
 
 static void
@@ -2485,6 +2538,7 @@ peak_wayland_window_set_opacity(PeakWindowInternal *intern, uint8_t alpha)
 	if (!w)
 		return;
 	w->opacity = alpha;
+	w->shm_stale = 1;
 	if (!w->alpha || !w->surface)
 		return;
 	memset(args, 0, sizeof args);

@@ -2,7 +2,7 @@ const std = @import("std");
 
 const vec_len = std.simd.suggestVectorLength(u8) orelse 16;
 const Vec = @Vector(vec_len, u8);
-const Mask = std.meta.Int(.unsigned, vec_len);
+const Mask = @Int(.unsigned, vec_len);
 
 comptime {
     std.debug.assert(vec_len <= 64);

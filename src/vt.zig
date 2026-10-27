@@ -282,9 +282,7 @@ pub const VtState = struct {
         for (runs) |run| {
             const slice = self.storage[run.off .. run.off + run.len];
             switch (run.kind) {
-                .plain => {
-                    for (slice) |b| self.printCodepoint(b);
-                },
+                .plain => self.printPlain(slice),
                 .utf8 => {
                     var view = std.unicode.Utf8View.init(slice) catch continue;
                     var iter = view.iterator();
@@ -495,6 +493,48 @@ pub const VtState = struct {
             g.wrap_pending = false;
         }
         self.last_cp = mapped;
+    }
+
+    /// Bulk `printCodepoint` for a `.plain` run (0x21..0x7E: width 1, never
+    /// combining). Fills the rest of the row at once; wrap, insert mode and
+    /// charset mapping take the per-codepoint path.
+    pub fn printPlain(self: *VtState, bytes: []const u8) void {
+        const set = switch (self.gl) {
+            0 => self.g0,
+            1 => self.g1,
+            2 => self.g2,
+            3 => self.g3,
+        };
+        if (self.flags.insert_mode or self.ss_active or set == .dec_special) {
+            for (bytes) |b| self.printCodepoint(b);
+            return;
+        }
+        var rest = bytes;
+        while (rest.len != 0) {
+            const g = self.grid();
+            if (g.wrap_pending or g.cursor.col >= self.cols) {
+                self.printCodepoint(rest[0]);
+                rest = rest[1..];
+                continue;
+            }
+            const n = @min(self.cols - g.cursor.col, rest.len);
+            const template: Cell = .{ .attrs = self.paintAttrs(), .fg = g.fg, .bg = g.bg, .ul = self.penUl() };
+            const cells = @as([*]Cell, @ptrCast(g.getCell(g.cursor.row, g.cursor.col)))[0..n];
+            for (cells, rest[0..n]) |*slot, b| {
+                slot.* = template;
+                slot.codepoint = b;
+            }
+            self.markDirty(g.cursor.row);
+            g.cursor.col += @intCast(n);
+            if (g.cursor.col >= self.cols) {
+                g.cursor.col = self.cols - 1;
+                g.wrap_pending = self.flags.auto_wrap;
+            } else {
+                g.wrap_pending = false;
+            }
+            self.last_cp = rest[n - 1];
+            rest = rest[n..];
+        }
     }
 
     fn mapCp(self: *VtState, cp: u21) u21 {
@@ -1102,7 +1142,7 @@ pub const VtState = struct {
             2048 => self.flags.size_notifications,
             8452 => self.flags.sixel_cursor_right,
             737769 => self.flags.ime,
-            556 => if (comptime builtin.mode == .Debug) self.debug_overlay.any() else return 0,
+            556 => if (comptime builtin.mode == .debug) self.debug_overlay.any() else return 0,
             else => return 0,
         };
         return if (on) 1 else 2;
@@ -2179,7 +2219,7 @@ test "osc 556 debug overlay" {
     var vt = try VtState.init(std.testing.allocator, 8, 2, 2, &dummy);
     defer vt.deinit();
     Osc.dispatch(&vt, "\x1b]556;wrap,lcf\x07");
-    if (comptime builtin.mode == .Debug) {
+    if (comptime builtin.mode == .debug) {
         try std.testing.expect(vt.debug_overlay.wrap);
         try std.testing.expect(vt.debug_overlay.lcf);
         try std.testing.expect(!vt.debug_overlay.grid);
@@ -2187,7 +2227,7 @@ test "osc 556 debug overlay" {
         try std.testing.expect(!vt.debug_overlay.any());
     }
     applyCsi(&vt, "\x1b[?556h");
-    if (comptime builtin.mode == .Debug) {
+    if (comptime builtin.mode == .debug) {
         try std.testing.expect(vt.debug_overlay.any());
         try std.testing.expectEqual(@as(u16, 1), vt.privateMode(556));
     }
@@ -2271,4 +2311,46 @@ test "color stack restores default cells and pens" {
     applyCsi(&vt, "\x1b[49m");
     vt.printCodepoint('d');
     try std.testing.expectEqual(original, vt.grid().cellAt(0, 3).bg);
+}
+
+test "printPlain matches per-codepoint printing" {
+    const gpa = std.testing.allocator;
+    var dummy: [1]u8 = .{0};
+    const text = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ!#$%";
+    // Start column, DECAWM, insert mode, DEC special graphics.
+    const cases = [_]struct { col: u16, wrap: bool, insert: bool, dec: bool, pending: bool }{
+        .{ .col = 0, .wrap = true, .insert = false, .dec = false, .pending = false },
+        .{ .col = 5, .wrap = true, .insert = false, .dec = false, .pending = false },
+        .{ .col = 9, .wrap = true, .insert = false, .dec = false, .pending = true },
+        .{ .col = 3, .wrap = false, .insert = false, .dec = false, .pending = false },
+        .{ .col = 2, .wrap = true, .insert = true, .dec = false, .pending = false },
+        .{ .col = 1, .wrap = true, .insert = false, .dec = true, .pending = false },
+    };
+    for (cases) |case| {
+        for ([_]usize{ 1, 7, 10, 23, text.len }) |len| {
+            var a = try VtState.init(gpa, 10, 4, 4, &dummy);
+            defer a.deinit();
+            var b = try VtState.init(gpa, 10, 4, 4, &dummy);
+            defer b.deinit();
+            for ([_]*VtState{ &a, &b }) |vt| {
+                applyCsi(vt, "\x1b[1;31m");
+                vt.flags.auto_wrap = case.wrap;
+                vt.flags.insert_mode = case.insert;
+                if (case.dec) vt.g0 = .dec_special;
+                vt.grid().cursor = .{ .row = 1, .col = case.col };
+                vt.grid().wrap_pending = case.pending;
+                vt.clearDirty();
+            }
+            a.printPlain(text[0..len]);
+            for (text[0..len]) |ch| b.printCodepoint(ch);
+            var r: u16 = 0;
+            while (r < 4) : (r += 1) {
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(b.rowCells(r)), std.mem.sliceAsBytes(a.rowCells(r)));
+                try std.testing.expectEqual(b.lineDirty(r), a.lineDirty(r));
+            }
+            try std.testing.expectEqual(b.cursor(), a.cursor());
+            try std.testing.expectEqual(b.grid().wrap_pending, a.grid().wrap_pending);
+            try std.testing.expectEqual(b.last_cp, a.last_cp);
+        }
+    }
 }

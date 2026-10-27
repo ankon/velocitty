@@ -520,30 +520,81 @@ fn padColor(term: *const VtState) u32 {
     return Draw.Frame.pack(c);
 }
 
-fn blitFrame(dst: *Platform.Framebuffer, src: *const Draw.Frame, bg: u32) void {
+/// Copies the frame into the window buffer and presents it. While the window
+/// buffer, layout and pad color match the last full present, only the frame's
+/// damaged rows are copied and presented; anything else is a full blit.
+const Presenter = struct {
+    pixels: ?[*]u32 = null,
+    dst_w: u32 = 0,
+    dst_h: u32 = 0,
+    stride: u32 = 0,
+    src_w: u32 = 0,
+    src_h: u32 = 0,
+    bg: u32 = 0,
+    /// Set on expose/resize: the window may not hold the last present.
+    force: bool = true,
+
+    fn present(self: *Presenter, window: *Platform.Window, frame: *const Draw.Frame, bg: u32) void {
+        const fb = window.framebuffer();
+        const same = !self.force and self.pixels == fb.pixels.ptr and self.dst_w == fb.width and
+            self.dst_h == fb.height and self.stride == fb.stride and self.src_w == frame.width and
+            self.src_h == frame.height and self.bg == bg;
+        if (!same) {
+            blitFrame(fb, frame, bg);
+            window.present();
+            self.* = .{
+                .pixels = fb.pixels.ptr,
+                .dst_w = fb.width,
+                .dst_h = fb.height,
+                .stride = fb.stride,
+                .src_w = frame.width,
+                .src_h = frame.height,
+                .bg = bg,
+                .force = false,
+            };
+            return;
+        }
+        if (!frame.damaged()) return;
+        const y0: u32 = if (frame.dirty_full) 0 else frame.dirty_y;
+        const h: u32 = if (frame.dirty_full) frame.height else frame.dirty_h;
+        const o = frameOrigin(fb, frame);
+        const rows = @min(h, o.h -| y0);
+        var y: u32 = 0;
+        while (y < rows) : (y += 1) {
+            const d = fb.pixels[(y0 + y + o.y) * fb.stride + o.x ..][0..o.w];
+            const src = frame.pixels[(y0 + y) * frame.width ..][0..o.w];
+            @memcpy(d, src);
+        }
+        window.presentRect(o.y + y0, rows);
+    }
+};
+
+const Origin = struct { x: u32, y: u32, w: u32, h: u32 };
+
+/// Frame placement inside the window buffer: centered, clipped.
+fn frameOrigin(dst: *const Platform.Framebuffer, src: *const Draw.Frame) Origin {
     const ox: u32 = if (dst.width > src.width) (dst.width - src.width) / 2 else 0;
     const oy: u32 = if (dst.height > src.height) (dst.height - src.height) / 2 else 0;
-    const w = @min(dst.width -| ox, src.width);
-    const h = @min(dst.height -| oy, src.height);
-    if (ox == 0 and oy == 0 and w == dst.width and w == src.width and h == dst.height and h == src.height and dst.stride == src.width) {
+    return .{ .x = ox, .y = oy, .w = @min(dst.width -| ox, src.width), .h = @min(dst.height -| oy, src.height) };
+}
+
+fn blitFrame(dst: *Platform.Framebuffer, src: *const Draw.Frame, bg: u32) void {
+    const o = frameOrigin(dst, src);
+    if (o.x == 0 and o.y == 0 and o.w == dst.width and o.w == src.width and o.h == dst.height and o.h == src.height and dst.stride == src.width) {
         @memcpy(dst.pixels, src.pixels);
-    } else {
-        if (dst.stride == dst.width) {
-            @memset(dst.pixels, bg);
-        } else {
-            var y: u32 = 0;
-            while (y < dst.height) : (y += 1) {
-                @memset(dst.pixels[y * dst.stride ..][0..dst.width], bg);
-            }
+        return;
+    }
+    // Pad only outside the frame, then copy the frame rows.
+    var y: u32 = 0;
+    while (y < dst.height) : (y += 1) {
+        const row = dst.pixels[y * dst.stride ..][0..dst.width];
+        if (y < o.y or y >= o.y + o.h or o.w == 0) {
+            @memset(row, bg);
+            continue;
         }
-        if (w != 0 and h != 0) {
-            var y: u32 = 0;
-            while (y < h) : (y += 1) {
-                const d = dst.pixels[(y + oy) * dst.stride + ox ..][0..w];
-                const s = src.pixels[y * src.width ..][0..w];
-                @memcpy(d, s);
-            }
-        }
+        @memset(row[0..o.x], bg);
+        @memcpy(row[o.x..][0..o.w], src.pixels[(y - o.y) * src.width ..][0..o.w]);
+        @memset(row[o.x + o.w ..], bg);
     }
 }
 
@@ -626,6 +677,7 @@ const EventLoop = struct {
     running: *bool,
     need_draw: *bool,
     need_layout: *bool,
+    presenter: Presenter = .{},
     sel: Select.State = .{},
     dragging: bool = false,
     drag_moved: bool = false,
@@ -656,9 +708,13 @@ const EventLoop = struct {
                 self.clearSel();
                 self.need_layout.* = true;
                 self.need_draw.* = true;
+                self.presenter.force = true;
             },
 
-            .redraw => self.need_draw.* = true,
+            .redraw => {
+                self.need_draw.* = true;
+                self.presenter.force = true;
+            },
             .focus_gained => {
                 self.resetMouse();
                 self.need_layout.* = true;
@@ -1178,9 +1234,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (need_draw and !hold_sync) {
             frame.renderSel(&term, cell_w, cell_h, type_ptr, size_px, eloop.sel);
             term.clearDirty();
-            const fb = window.framebuffer();
-            blitFrame(fb, &frame, padColor(&term));
-            window.present();
+            eloop.presenter.present(&window, &frame, padColor(&term));
             need_draw = false;
             sync_hold = 0;
         } else if (need_draw and hold_sync) {

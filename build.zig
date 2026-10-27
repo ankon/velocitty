@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     // Standard run step
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run velocitty");
     run_step.dependOn(&run_cmd.step);
@@ -42,8 +42,8 @@ pub fn build(b: *std.Build) void {
     const bench_run = b.addRunArtifact(bench_exe);
     bench_run.setCwd(b.path("."));
     bench_run.has_side_effects = true;
-    if (b.args) |args| bench_run.addArgs(args);
-    const bench_step = b.step("bench", "Run pipeline microbenchmark: IO/parse/VT/draw/LRU (ReleaseFast)");
+    bench_run.addPassthruArgs();
+    const bench_step = b.step("bench", "Run PTY pipeline, glyph cache and render benchmarks (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 
     // Release: Linux gnu/musl, x86_64 and aarch64. Peak compiles against
@@ -53,7 +53,6 @@ pub fn build(b: *std.Build) void {
     package_step.dependOn(release_step);
 
     const version = @import("build.zig.zon").version;
-    const packages_dir = b.pathFromRoot("packages");
 
     for (targets) |query| {
         const resolved = b.resolveTargetQuery(query);
@@ -76,7 +75,9 @@ pub fn build(b: *std.Build) void {
         pkg_cmd.addFileArg(b.path("velocitty.desktop"));
         pkg_cmd.addFileArg(b.path("icon.png"));
         pkg_cmd.addFileArg(b.path("velocitty.1"));
-        pkg_cmd.addArg(packages_dir);
+        // Relative to the build root (cwd below).
+        pkg_cmd.addArg("packages");
+        pkg_cmd.setCwd(b.path("."));
         pkg_cmd.stdio = .inherit;
         pkg_cmd.has_side_effects = true;
         pkg_cmd.disable_zig_progress = true;

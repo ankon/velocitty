@@ -109,6 +109,11 @@ pub const Window = struct {
         self.impl.present();
     }
 
+    /// Present only framebuffer rows [y, y+h); the rest of the last present stays.
+    pub fn presentRect(self: *Window, y: u32, h: u32) void {
+        self.impl.presentRect(y, h);
+    }
+
     pub fn pollEvent(self: *Window, ev: *Event) bool {
         return self.impl.pollEvent(ev);
     }
@@ -244,6 +249,10 @@ const PeakWindow = struct {
 
     pub fn present(self: *PeakWindow) void {
         self.win.present();
+    }
+
+    pub fn presentRect(self: *PeakWindow, y: u32, h: u32) void {
+        self.win.presentRect(y, h);
     }
 
     pub fn eventFd(self: *PeakWindow) std.posix.fd_t {
@@ -729,13 +738,13 @@ fn pushChildEnv(dims: Dimensions) void {
     _ = setenv("COLORTERM", "truecolor", 1);
     _ = setenv("TERM_PROGRAM", "velocitty", 1);
     var id_buf: [32]u8 = undefined;
-    const id = std.fmt.bufPrintZ(&id_buf, "{d}", .{peak.pid()}) catch "1";
+    const id = std.mem.printSentinel(&id_buf, "{d}", .{peak.pid()}, 0) catch "1";
     _ = setenv("KITTY_WINDOW_ID", id, 1);
     _ = unsetenv("KITTY_LISTEN_ON");
     var col_buf: [16]u8 = undefined;
     var row_buf: [16]u8 = undefined;
-    const cols = std.fmt.bufPrintZ(&col_buf, "{d}", .{dims.cols}) catch "80";
-    const rows = std.fmt.bufPrintZ(&row_buf, "{d}", .{dims.rows}) catch "24";
+    const cols = std.mem.printSentinel(&col_buf, "{d}", .{dims.cols}, 0) catch "80";
+    const rows = std.mem.printSentinel(&row_buf, "{d}", .{dims.rows}, 0) catch "24";
     _ = setenv("COLUMNS", cols, 1);
     _ = setenv("LINES", rows, 1);
 }

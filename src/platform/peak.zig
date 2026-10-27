@@ -252,6 +252,10 @@ pub const Window = extern struct {
         peak_window_present(self);
     }
 
+    pub fn presentRect(self: *Window, y: u32, h: u32) void {
+        peak_window_present_rect(self, y, h);
+    }
+
     pub fn setTitle(self: *Window, name: [:0]const u8) void {
         peak_window_set_title(self, name.ptr);
     }
@@ -414,6 +418,7 @@ extern fn peak_window_fd(win: *Window) c_int;
 extern fn peak_window_pending(win: *Window) c_int;
 extern fn peak_window_backbuffer(win: *Window, width: *usize, height: *usize) ?[*]u32;
 extern fn peak_window_present(win: *Window) void;
+extern fn peak_window_present_rect(win: *Window, y: u32, h: u32) void;
 extern fn peak_window_set_title(win: *Window, name: [*:0]const u8) void;
 extern fn peak_window_set_class(win: *Window, name: [*:0]const u8) void;
 extern fn peak_window_set_opacity(win: *Window, alpha: u8) void;

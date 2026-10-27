@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn log(comptime fmt: []const u8, args: anytype) void {
-    if (builtin.mode == .Debug) {
+    if (builtin.mode == .debug) {
         std.log.debug(fmt, args);
     }
 }
@@ -36,7 +36,7 @@ pub const Overlay = packed struct(u8) {
     }
 };
 
-pub const live = builtin.mode == .Debug;
+pub const live = builtin.mode == .debug;
 
 pub const col_grid: u32 = 0xFF3A3A3A;
 pub const col_wrap: u32 = 0xFF00E5FF;

@@ -616,6 +616,27 @@ peak_platform_window_buffer(PeakWindowInternal *intern, size_t *width, size_t *h
 }
 
 static void
+peak_platform_window_present_rect(PeakWindowInternal *intern, uint32_t y, uint32_t h)
+{
+	struct peak_linux_win *w;
+
+	if (peak_linux_kind == PEAK_LINUX_WAYLAND) {
+		peak_wayland_window_present_rect(intern, y, h);
+		return;
+	}
+	w = intern ? intern->w : NULL;
+	if (!w || !w->ximage || !peak_linux.display)
+		return;
+	if (y >= (uint32_t)w->height)
+		return;
+	if (h > (uint32_t)w->height - y)
+		h = (uint32_t)w->height - y;
+	peak_x11.XPutImage(peak_linux.display, w->window, w->gfx_ctx, w->ximage,
+		0, (int)y, 0, (int)y, w->width, h);
+	peak_x11.XFlush(peak_linux.display);
+}
+
+static void
 peak_platform_window_present(PeakWindowInternal *intern)
 {
 	struct peak_linux_win *w;

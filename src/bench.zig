@@ -1,66 +1,79 @@
-//! Headless, synthetic CPU benchmarks. No window, PTY drain, or compositor latency.
-//! `zig build bench -- --quick`; see --help for sampling controls.
+//! Headless benchmarks: PTY → circbuffer scan → VT → render → present copy.
+//! Every row reports p50/p95 over individual frames or lookup batches.
+//! No window, Peak, or compositor. `zig build bench -- --help`.
 const std = @import("std");
 const builtin = @import("builtin");
+const linux = std.os.linux;
+const posix = std.posix;
 const CircBuffer = @import("circbuffer.zig").CircBuffer;
 const VtState = @import("vt.zig").VtState;
 const Draw = @import("draw.zig");
 const Type = @import("type.zig");
 const Select = @import("select.zig");
-const EastAsian = @import("type/eastasian.zig");
 
+// Same ring, scrollback and glyph cache as main.zig.
 const ring_cap = 64 * 1024;
+const scrollback = 1000;
+const cache_capacity = 2048;
 const size_px: f32 = 16;
+
 const font_paths = [_][]const u8{
-    "/usr/share/fonts/iosevka-term/IosevkaTermNerdFontMono-Regular.ttf",
-    "/usr/share/fonts/iosevka-term/IosevkaTermNerdFont-Regular.ttf",
+    "/usr/share/fonts/TTF/IosevkaNerdFontMono-Regular.ttf",
     "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-    "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
 };
-const lru_cps = [_]u21{ 0xA9, 0xAE, 0xB0, 0xB1, 0xD7, 0xF7, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x20AC, 0x2190, 0x2191, 0x2192 };
+// main.zig fallback_paths (Linux).
+const fallback_paths = [_][]const u8{
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/gnu-free/FreeSans.otf",
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+};
 
 const Options = struct {
     quick: bool = false,
-    samples: u32 = 5,
-    warmup: u32 = 1,
-    iterations: u32 = 10,
+    mib: u32 = 4,
+    burst_kib: u32 = 16,
+    cols: u16 = 120,
+    rows: u16 = 40,
+    samples: u32 = 200,
     font: ?[]const u8 = null,
+    only: ?[]const u8 = null,
     help: bool = false,
 };
 
 const usage =
-    \\Usage: zig build bench -- [--quick] [--samples N] [--warmup N]
-    \\                         [--iterations N] [--font PATH] [--help]
-    \\  samples: measured batches (1..100; default 5)
-    \\  warmup:  discarded batches (0..100; default 1)
-    \\  iterations: operations per batch (1..10000; default 10)
-    \\  quick: defaults to 3 samples, 1 warmup, 2 iterations; large frames use
-    \\         one iteration per batch (normal: ceil(iterations / 5)).
-    \\  Explicit counts override quick defaults, regardless of argument order.
-    \\  Both --name=value and --name value are accepted. Unknown/duplicate
-    \\  options and malformed values fail. Explicit font errors are fatal.
-    \\  Without a font, CPU parsing/VT and placeholder rendering still run;
-    \\  glyph/raster/atlas benchmarks are explicitly skipped.
-    \\  Logs: bench/<UTC>-<git12>[-dirty].txt and last_bench in the current dir.
-    \\  Metrics are sample-batch averages, not individual-frame latency tails.
-    \\  These are headless CPU costs, not PTY/compositor/input latency or FPS.
+    \\Usage: zig build bench -- [options]
+    \\  --quick           1 MiB per workload, 40 samples (explicit values still win)
+    \\  --mib N           bytes per PTY workload in MiB (1..256; default 4)
+    \\  --burst KIB       bytes read per frame (1..48; default 16)
+    \\  --grid COLSxROWS  pipeline/render grid (default 120x40)
+    \\  --samples N       render frames / glyph batches per row (10..10000; default 200)
+    \\  --font PATH       primary font (default: fc-match monospace, like main.zig)
+    \\  --only A,B        sections: ascii unicode grapheme csi-short long-escape
+    \\                    kitty-image sixel glyph render
+    \\  --help
+    \\Pipeline rows: one frame = read one burst from a real PTY (writer thread,
+    \\raw slave), consumeAndGetRuns, feedRuns, renderSel, damaged-rows copy (present).
+    \\io is time inside read(2); time blocked in poll(2) is io-wait, excluded.
+    \\Logs: bench/<UTC>-<git12>[-dirty].txt and last_bench.
     \\
 ;
 
 fn parseOptions(args: []const [*:0]const u8) !Options {
     var opt: Options = .{};
-    var seen: u8 = 0;
+    var seen_mib = false;
+    var seen_samples = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = std.mem.span(args[i]);
         const eq = std.mem.indexOfScalar(u8, arg, '=');
         const name = arg[0 .. eq orelse arg.len];
-        const bit: u8 = if (std.mem.eql(u8, name, "--quick")) 1 else if (std.mem.eql(u8, name, "--samples")) 2 else if (std.mem.eql(u8, name, "--warmup")) 4 else if (std.mem.eql(u8, name, "--iterations")) 8 else if (std.mem.eql(u8, name, "--font")) 16 else if (std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h")) 32 else return error.UnknownOption;
-        if (seen & bit != 0) return error.DuplicateOption;
-        seen |= bit;
-        if (bit == 1 or bit == 32) {
+        if (std.mem.eql(u8, name, "--quick") or std.mem.eql(u8, name, "--help") or std.mem.eql(u8, name, "-h")) {
             if (eq != null) return error.UnexpectedValue;
-            if (bit == 1) opt.quick = true else opt.help = true;
+            if (name[2] == 'q') opt.quick = true else opt.help = true;
             continue;
         }
         const value: []const u8 = if (eq) |at| arg[at + 1 ..] else blk: {
@@ -68,36 +81,64 @@ fn parseOptions(args: []const [*:0]const u8) !Options {
             if (i == args.len) return error.MissingValue;
             break :blk std.mem.span(args[i]);
         };
-        if (value.len == 0) return error.MissingValue;
-        if (bit == 16) {
-            if (std.mem.startsWith(u8, value, "--")) return error.MissingValue;
+        if (value.len == 0 or std.mem.startsWith(u8, value, "--")) return error.MissingValue;
+        if (std.mem.eql(u8, name, "--mib")) {
+            opt.mib = try count(value, 1, 256);
+            seen_mib = true;
+        } else if (std.mem.eql(u8, name, "--burst")) {
+            opt.burst_kib = try count(value, 1, 48);
+        } else if (std.mem.eql(u8, name, "--samples")) {
+            opt.samples = try count(value, 10, 10000);
+            seen_samples = true;
+        } else if (std.mem.eql(u8, name, "--grid")) {
+            const x = std.mem.indexOfScalar(u8, value, 'x') orelse return error.InvalidGrid;
+            opt.cols = @intCast(count(value[0..x], 2, 1000) catch return error.InvalidGrid);
+            opt.rows = @intCast(count(value[x + 1 ..], 2, 1000) catch return error.InvalidGrid);
+        } else if (std.mem.eql(u8, name, "--font")) {
             opt.font = value;
-        } else {
-            for (value) |c| if (c < '0' or c > '9') return error.InvalidCount;
-            const n = std.fmt.parseInt(u32, value, 10) catch return error.InvalidCount;
-            const max: u32 = if (bit == 8) 10000 else 100;
-            if (n > max or (n == 0 and bit != 4)) return error.InvalidCount;
-            switch (bit) {
-                2 => opt.samples = n,
-                4 => opt.warmup = n,
-                8 => opt.iterations = n,
-                else => unreachable,
-            }
-        }
+        } else if (std.mem.eql(u8, name, "--only")) {
+            opt.only = value;
+        } else return error.UnknownOption;
     }
     if (opt.quick) {
-        if (seen & 2 == 0) opt.samples = 3;
-        if (seen & 8 == 0) opt.iterations = 2;
+        if (!seen_mib) opt.mib = 1;
+        if (!seen_samples) opt.samples = 40;
     }
     return opt;
 }
 
+fn count(value: []const u8, min: u32, max: u32) !u32 {
+    for (value) |c| if (c < '0' or c > '9') return error.InvalidCount;
+    const n = std.fmt.parseInt(u32, value, 10) catch return error.InvalidCount;
+    if (n < min or n > max) return error.InvalidCount;
+    return n;
+}
+
+fn wanted(opt: Options, section: []const u8) bool {
+    const only = opt.only orelse return true;
+    var it = std.mem.splitScalar(u8, only, ',');
+    while (it.next()) |s| if (std.mem.eql(u8, s, section)) return true;
+    return false;
+}
+
 const Log = struct {
     buffer: std.Io.Writer.Allocating,
+    echo: bool = true,
     fn print(self: *Log, comptime fmt: []const u8, args: anytype) !void {
-        std.debug.print(fmt, args);
+        if (self.echo) std.debug.print(fmt, args);
         try self.buffer.writer.print(fmt, args);
     }
+};
+
+/// Shared setup: fonts and cell metrics.
+const Env = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    opt: Options,
+    ctx: ?*Type.Context,
+    cell_w: u32,
+    cell_h: u32,
+    emoji: bool,
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -109,550 +150,783 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("{s}", .{usage});
         return;
     }
-    const allocator = std.heap.page_allocator;
-    var threaded = std.Io.Threaded.init(allocator, .{ .environ = init.environ });
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = init.environ });
     defer threaded.deinit();
     const io = threaded.io();
-    var log: Log = .{ .buffer = .init(allocator) };
+    var log: Log = .{ .buffer = .init(gpa) };
     defer log.buffer.deinit();
+
     const stamp = try utcStamp(io);
-    const git = try gitRev(allocator, io);
-    defer allocator.free(git.hash);
-    try log.print("velocitty headless CPU benchmark v2\nutc {s}\ngit {s} status={s}\n", .{ stamp.iso, git.hash, git.status });
+    const git = try gitRev(gpa, io);
+    defer gpa.free(git.hash);
+    try log.print("velocitty benchmark v3\nutc {s}\ngit {s} status={s}\n", .{ stamp.iso, git.hash, git.status });
     try log.print("compiler Zig {s} optimize={s} target={s}-{s}-{s} cpu-target={s}\n", .{
         builtin.zig_version_string, @tagName(builtin.mode), @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), @tagName(builtin.abi), builtin.cpu.model.name,
     });
-    try machineInfo(&log, allocator, io);
-    try log.print("settings quick={} samples={d} warmup={d} iterations={d} ring={d} size_px={d} workload=deterministic-v2 (no random seed)\n", .{
-        opt.quick, opt.samples, opt.warmup, opt.iterations, ring_cap, size_px,
+    try machineInfo(&log, gpa, io);
+    try log.print("settings quick={} mib={d} burst={d}KiB grid={d}x{d} samples={d} only={s}\n", .{
+        opt.quick, opt.mib, opt.burst_kib, opt.cols, opt.rows, opt.samples, opt.only orelse "all",
     });
-    try log.print("clock=monotonic awake; min/median/p95/max and spread=(max-min)/median are batch-average ns/op.\nSetup/reset/checksums excluded; timing, memory barriers and loop bookkeeping included.\nNo PTY/readPTY, Peak, scheduling, GPU/compositor, or input-to-echo measured.\nByte rates describe the named input/copy domain, never painted bytes for skip/dirty frames.\n\n", .{});
 
-    const font = try loadFont(io, allocator, opt.font);
-    defer if (font) |f| allocator.free(f.bytes);
-    var ctx: ?Type.Context = null;
-    defer if (ctx) |*c| c.deinit();
-    var cell_w: u32 = 8;
-    var cell_h: u32 = 16;
-    if (font) |f| {
-        ctx = try Type.Context.init(allocator, .{});
-        const c = &ctx.?;
-        _ = try c.addFont(f.bytes, .{});
-        const metrics = try c.metrics(size_px);
-        const height = @ceil(metrics.ascender - metrics.descender + metrics.line_gap);
-        const glyph = try c.glyph('M', size_px);
-        const width = @ceil(glyph.advance);
-        // Validate before converting: bad float-to-int is UB in ReleaseFast.
-        if (!std.math.isFinite(width) or !std.math.isFinite(height) or width <= 0 or height <= 0 or width > 256 or height > 256) return error.InvalidFontMetrics;
-        cell_h = @intFromFloat(height);
-        cell_w = @intFromFloat(width);
-        try log.print("font {s} bytes={d} hash={x} cell={d}x{d}; regular face only, no shaping/fallback faces\n", .{ f.path, f.bytes.len, hashBytes(f.bytes), cell_w, cell_h });
-    } else {
-        try log.print("font NONE: placeholder render, glyph/raster/atlas SKIPPED\n", .{});
+    // Fonts: primary + main.zig fallbacks, cache/atlas sized like main.zig.
+    var blobs: std.ArrayList(Font) = .empty;
+    defer {
+        for (blobs.items) |b| {
+            gpa.free(b.bytes);
+            gpa.free(b.path);
+        }
+        blobs.deinit(gpa);
     }
-    const type_ctx: ?*Type.Context = if (ctx) |*c| c else null;
-    var work = try Work.init(allocator, io, 80, 24, cell_w, cell_h, type_ctx);
-    defer work.deinit();
-    try log.print("ring mirrored={}; screen=80x24 framebuffer={d}x{d}\n", .{ work.ring.mapped, work.frame.width, work.frame.height });
+    try loadFonts(io, gpa, opt.font, &blobs);
+    var ctx_store: Type.Context = try Type.Context.init(gpa, .{ .cache_capacity = cache_capacity });
+    defer ctx_store.deinit();
+    var env: Env = .{ .gpa = gpa, .io = io, .opt = opt, .ctx = null, .cell_w = 8, .cell_h = 16, .emoji = false };
+    if (blobs.items.len != 0) {
+        var fallbacks: std.ArrayList(Type.FontId) = .empty;
+        defer fallbacks.deinit(gpa);
+        for (blobs.items, 0..) |b, i| {
+            const id = ctx_store.addFont(b.bytes, .{}) catch {
+                try log.print("font {s}: unusable, skipped\n", .{b.path});
+                continue;
+            };
+            if (i != 0) try fallbacks.append(gpa, id);
+            if (ctx_store.faces.items[@intFromEnum(id)].font.color != null) env.emoji = true;
+            try log.print("font {s} {s} bytes={d}\n", .{ if (i == 0) "primary " else "fallback", b.path, b.bytes.len });
+        }
+        if (ctx_store.primary != null) {
+            try ctx_store.setFallbacks(fallbacks.items);
+            const m = try ctx_store.metrics(size_px);
+            const h = @ceil(m.ascender - m.descender + m.line_gap);
+            const w = @ceil((try ctx_store.glyph('M', size_px)).advance);
+            // Bad float-to-int is UB in ReleaseFast.
+            if (!std.math.isFinite(w) or !std.math.isFinite(h) or w <= 0 or h <= 0 or w > 256 or h > 256) return error.InvalidFontMetrics;
+            env.cell_w = @intFromFloat(w);
+            env.cell_h = @intFromFloat(h);
+            env.ctx = &ctx_store;
+        }
+    }
+    if (env.ctx == null) try log.print("font NONE: placeholder render, glyph section skipped\n", .{});
+    try log.print("size_px={d} cell={d}x{d} glyph-cache={d} atlas=1024x1024 ring={d}\n", .{ size_px, env.cell_w, env.cell_h, cache_capacity, ring_cap });
+    try log.print("p50/p95 are nearest-rank over frames (pipeline/render) or 64-lookup batches (glyph).\n", .{});
 
-    const corpora = [_]struct { name: []const u8, unit: []const u8 }{
-        .{ .name = "ASCII", .unit = "abcdefghijklmnopqrstuvwxyz 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n" },
-        .{ .name = "controls", .unit = "\x1b[32mgreen\x1b[0m text\tend\r\n\x1b[2K\x1b[1G\x1b[4munderlined\x1b[0m\r\n" },
-        .{ .name = "mixed-UTF8", .unit = "ASCII 汉字测试 あア 한 café © →\r\n" },
-    };
-    for (corpora) |corpus| {
-        const payload = try makePayload(allocator, corpus.unit);
-        defer allocator.free(payload);
-        work.payload = payload;
-        work.loadPayload();
-        try log.print("\ninput {s}: corpus/raw={d} B; parse/VT start with all bytes retained, no loss\n", .{ corpus.name, payload.len });
-        try run(&log, opt, &work, .ingest, "synthetic ring overwrite copy", .bytes, payload.len, opt.iterations);
-        try run(&log, opt, &work, .lines, "line scan all input", .bytes, payload.len, opt.iterations);
-        try run(&log, opt, &work, .runs_all, "split runs all lines", .bytes, payload.len, opt.iterations);
-        work.loadPayload();
-        work.ring.consumeAndPreparse();
-        work.ring.splitIntoRuns(work.ring.getLastNLines(24));
-        const selected = runBytes(&work.ring);
-        try log.print("last-24 experiment: scanned={d} selected/feed={d} B; NOT runtime semantics\n", .{ payload.len, selected });
-        try run(&log, opt, &work, .runs_last, "split runs selected last-24", .bytes, selected, opt.iterations);
-        try run(&log, opt, &work, .parse_all, "scan+split all input", .bytes, payload.len, opt.iterations);
-        try run(&log, opt, &work, .parse_last, "scan+split last-24 (scanned B)", .bytes, payload.len, opt.iterations);
-        try run(&log, opt, &work, .vt_all, "VT feed all (reset excluded)", .bytes, payload.len, opt.iterations);
-        try run(&log, opt, &work, .vt_last, "VT feed selected last-24", .bytes, selected, opt.iterations);
-        try run(&log, opt, &work, .pipeline, "ingest->all VT->render->copy", .bytes, payload.len, opt.iterations);
-        try log.print("  pipeline/pass raw={d} fed={d} scanned={d} dropped=0 final-unread={d} max-retained={d} chunks={d} renders/copies={d}\n", .{
-            payload.len, work.pipeline_fed, work.pipeline_scanned, work.ring.head - work.ring.tail, work.max_unread, work.pipeline_chunks, work.pipeline_chunks,
-        });
+    spinUp();
+    for (workloads) |wl| {
+        if (!wanted(opt, wl.name)) continue;
+        const bytes = try generate(gpa, wl, @as(usize, opt.mib) << 20);
+        defer gpa.free(bytes);
+        try runPipeline(&log, &env, wl, bytes);
     }
-    // Corpus allocations above are scoped to each loop iteration.
-    work.payload = &.{};
-    try log.print("\nlossy firehose: synthetic memcpy ingestion only; 4 MiB/op, 64 KiB retained, no parse/VT\n", .{});
-    const firehose = try makePayload(allocator, "synthetic lossy firehose ring fill\r\n");
-    defer allocator.free(firehose);
-    work.payload = firehose;
-    try run(&log, opt, &work, .firehose, "overrun ring ingest", .bytes, 4 * 1024 * 1024, opt.iterations);
-    work.payload = &.{};
-    try log.print("\nunicode width: queries, NOT bytes\n", .{});
-    try run(&log, opt, &work, .width_ascii, "cellWidth ASCII", .queries, 128, opt.iterations);
-    try run(&log, opt, &work, .width_bmp, "cellWidth U+0000..U+2FFF", .queries, 0x3000, opt.iterations);
-    try run(&log, opt, &work, .width_cjk, "cellWidth CJK range", .queries, 4096, opt.iterations);
-
-    try renderSuite(&log, opt, &work, opt.iterations);
-    if (type_ctx != null) {
-        try log.print("\nfonts: glyph queries (not coverage bandwidth); cache hits peek without refreshing LRU\n", .{});
-        try run(&log, opt, &work, .glyph_ascii, "glyph hot ASCII table", .queries, 95, opt.iterations);
-        try run(&log, opt, &work, .glyph_lru, "glyph hot non-ASCII cache", .queries, lru_cps.len, opt.iterations);
-        try run(&log, opt, &work, .peek_lru, "peekGlyph non-ASCII cache", .queries, lru_cps.len, opt.iterations);
-        try run(&log, opt, &work, .atlas_reset, "clearAtlas INCLUDING ASCII prewarm", .operations, 1, opt.iterations);
-        try run(&log, opt, &work, .raster, "rasterize A incl alloc/free", .operations, 1, opt.iterations);
-        try run(&log, opt, &work, .atlas, "atlas pack+blit A", .operations, 1, opt.iterations);
+    if (env.ctx != null and wanted(opt, "glyph")) try glyphSuite(&log, &env);
+    if (wanted(opt, "render")) {
+        try renderSuite(&log, &env, opt.cols, opt.rows, opt.samples);
+        const big_cols: u16 = @intCast(@max(2, 3840 / env.cell_w));
+        const big_rows: u16 = @intCast(@max(2, 2160 / env.cell_h));
+        try renderSuite(&log, &env, big_cols, big_rows, @max(10, opt.samples / 5));
     }
-    // Both representative large sizes run in quick mode, with bounded repetitions.
-    const large_iters: u32 = if (opt.quick) 1 else @max(1, (opt.iterations + 4) / 5);
-    const sizes = [_][2]u16{
-        .{ 220, 60 },
-        .{ @intCast(@max(1, 3840 / cell_w)), @intCast(@max(1, 2160 / cell_h)) },
-    };
-    for (sizes) |wh| {
-        var large = try Work.init(allocator, io, wh[0], wh[1], cell_w, cell_h, type_ctx);
-        defer large.deinit();
-        try renderSuite(&log, opt, &large, large_iters);
-    }
-    try log.print("\nchecksum {x} (observable state/pixels; not a portable golden)\n", .{work.checksum});
     try saveLog(io, &log, stamp.file, git.hash, std.mem.eql(u8, git.status, "dirty"));
 }
 
-const Operation = enum {
-    ingest,
-    firehose,
-    lines,
-    runs_all,
-    runs_last,
-    parse_all,
-    parse_last,
-    vt_all,
-    vt_last,
-    pipeline,
-    width_ascii,
-    width_bmp,
-    width_cjk,
-    full,
-    skip,
-    single,
-    line,
-    cursor,
-    selection,
-    scroll,
-    resize,
-    copy,
-    memset,
-    glyph_ascii,
-    glyph_lru,
-    peek_lru,
-    atlas_reset,
-    raster,
-    atlas,
-};
-const Metric = enum { bytes, queries, frames, operations };
+// ---------------------------------------------------------------- statistics
 
-const Work = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
+const Pct = struct { p50: f64, p95: f64, mean: f64, sum: f64 };
+
+/// Nearest-rank percentiles. Sorts `values` in place.
+fn percentiles(values: []u64) Pct {
+    std.debug.assert(values.len != 0);
+    std.mem.sort(u64, values, {}, std.sort.asc(u64));
+    var sum: f64 = 0;
+    for (values) |v| sum += @floatFromInt(v);
+    return .{
+        .p50 = @floatFromInt(values[rank(values.len, 50)]),
+        .p95 = @floatFromInt(values[rank(values.len, 95)]),
+        .mean = sum / @as(f64, @floatFromInt(values.len)),
+        .sum = sum,
+    };
+}
+
+fn rank(n: usize, p: usize) usize {
+    return @max(1, (n * p + 99) / 100) - 1;
+}
+
+/// Busy 500 ms so frequency scaling ramps before the first section is timed.
+fn spinUp() void {
+    const end = nowNs() + 500 * std.time.ns_per_ms;
+    var x: u64 = 1;
+    while (nowNs() < end) {
+        for (0..10_000) |_| x = x *% 6364136223846793005 +% 1442695040888963407;
+        std.mem.doNotOptimizeAway(x);
+    }
+}
+
+fn nowNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+// ---------------------------------------------------------------- workloads
+
+const Workload = struct {
+    name: []const u8,
+    about: []const u8,
+    unit: *const fn (*Gen) anyerror!void,
+};
+
+const workloads = [_]Workload{
+    .{ .name = "ascii", .about = "printable lines 10..120 cols, CRLF", .unit = genAscii },
+    .{ .name = "unicode", .about = "single-codepoint non-ASCII: Latin/Greek/Cyrillic/box/CJK/Hangul/emoji", .unit = genUnicode },
+    .{ .name = "grapheme", .about = "multi-codepoint clusters: combining, ZWJ, flags, skin tones, VS16, Indic, jamo", .unit = genGrapheme },
+    .{ .name = "csi-short", .about = "TUI redraw: CUP/EL/CUF + short SGR around 1..8 chars", .unit = genCsiShort },
+    .{ .name = "long-escape", .about = "truecolor+underline SGR, OSC 8 long URLs, OSC 0/7/133, OSC 52 1-3 KiB", .unit = genLongEscape },
+    .{ .name = "kitty-image", .about = "kitty APC a=T f=32 64x64 RGBA, 4096-byte base64 chunks, ids 1..16", .unit = genKitty },
+    .{ .name = "sixel", .about = "DCS q 64x64, 8-color palette, RLE bands", .unit = genSixel },
+};
+
+const Gen = struct {
+    gpa: std.mem.Allocator,
+    out: std.ArrayList(u8) = .empty,
+    rng: u64 = 0x9E3779B97F4A7C15,
+    n: u32 = 0,
+
+    fn next(self: *Gen) u64 {
+        // splitmix64: deterministic, no seed option.
+        self.rng +%= 0x9E3779B97F4A7C15;
+        var z = self.rng;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        return z ^ (z >> 31);
+    }
+    fn below(self: *Gen, n: usize) usize {
+        return @intCast(self.next() % n);
+    }
+    fn pick(self: *Gen, pool: []const []const u8) []const u8 {
+        return pool[self.below(pool.len)];
+    }
+    fn put(self: *Gen, s: []const u8) !void {
+        try self.out.appendSlice(self.gpa, s);
+    }
+    fn fmt(self: *Gen, comptime f: []const u8, args: anytype) !void {
+        try self.out.print(self.gpa, f, args);
+    }
+    fn word(self: *Gen, len: usize) !void {
+        const alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./";
+        for (0..len) |_| try self.out.append(self.gpa, alpha[self.below(alpha.len)]);
+    }
+};
+
+fn generate(gpa: std.mem.Allocator, wl: Workload, target: usize) ![]u8 {
+    var g: Gen = .{ .gpa = gpa };
+    errdefer g.out.deinit(gpa);
+    try g.out.ensureTotalCapacity(gpa, target + 64 * 1024);
+    while (g.out.items.len < target) : (g.n += 1) try wl.unit(&g);
+    return g.out.toOwnedSlice(gpa);
+}
+
+fn genAscii(g: *Gen) !void {
+    const chars = "abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 (){}[];:,.<>=+-*/\"'#!?";
+    const len = 10 + g.below(111);
+    for (0..len) |_| try g.out.append(g.gpa, chars[g.below(chars.len)]);
+    try g.put("\r\n");
+}
+
+const unicode_pool = [_][]const u8{
+    "é", "ñ", "ü", "ß", "ø", "Ω", "λ", "π", "Ж", "я", "ש", "─", "│", "┌", "┘", "█", "░", "→", "✓", "★", "€", "©",
+    "汉", "字", "測", "試", "日", "本", "語", "한", "글", "あ", "ア", "😀", "🚀", "🎉", "🔥", "✨",
+};
+
+fn genUnicode(g: *Gen) !void {
+    const len = 10 + g.below(40);
+    for (0..len) |_| {
+        if (g.below(6) == 0) try g.put(" ") else try g.put(g.pick(&unicode_pool));
+    }
+    try g.put("\r\n");
+}
+
+const grapheme_pool = [_][]const u8{
+    "e\u{301}",        "a\u{308}\u{323}", "n\u{303}",       "o\u{302}\u{301}",
+    "Z\u{335}\u{336}\u{337}\u{338}\u{334}\u{33F}",
+    "👨\u{200D}👩\u{200D}👧\u{200D}👦", "👩🏻\u{200D}💻", "🏳\u{FE0F}\u{200D}🌈",
+    "👍🏽",               "🇵🇹",              "🇯🇵",              "❤\u{FE0F}",
+    "1\u{FE0F}\u{20E3}", "क्षि",             "\u{1100}\u{1161}\u{11A8}", "ก\u{E34}\u{E48}",
+};
+
+fn genGrapheme(g: *Gen) !void {
+    const len = 5 + g.below(25);
+    for (0..len) |_| {
+        try g.put(g.pick(&grapheme_pool));
+        if (g.below(3) == 0) try g.put(" ");
+    }
+    try g.put("\r\n");
+}
+
+fn genCsiShort(g: *Gen) !void {
+    const sgr = [_][]const u8{ "\x1b[0m", "\x1b[m", "\x1b[1m", "\x1b[7m", "\x1b[31m", "\x1b[32m", "\x1b[1;34m", "\x1b[39m", "\x1b[4m", "\x1b[22m" };
+    const moves = [_][]const u8{ "\x1b[K", "\x1b[2C", "\x1b[A", "\x1b[B", "\x1b[3D", "\x1b[?25l", "\x1b[?25h", "\r\n" };
+    try g.fmt("\x1b[{d};{d}H", .{ 1 + g.below(60), 1 + g.below(200) });
+    const segs = 3 + g.below(10);
+    for (0..segs) |_| {
+        try g.put(g.pick(&sgr));
+        try g.word(1 + g.below(8));
+        if (g.below(3) == 0) try g.put(g.pick(&moves));
+    }
+}
+
+fn genLongEscape(g: *Gen) !void {
+    switch (g.below(10)) {
+        0...3 => {
+            const c = g.next();
+            try g.fmt("\x1b[38;2;{d};{d};{d};48;2;{d};{d};{d};1;3;4:3;58;2;{d};{d};{d}m", .{
+                c & 255, (c >> 8) & 255, (c >> 16) & 255, (c >> 24) & 255, (c >> 32) & 255, (c >> 40) & 255, (c >> 48) & 255, (c >> 56) & 255, c & 127,
+            });
+            try g.word(5 + g.below(20));
+            try g.put("\x1b[0m ");
+        },
+        4...5 => {
+            try g.fmt("\x1b]8;id=l{d};https://example.com/", .{g.n});
+            try g.word(150 + g.below(150));
+            try g.put("\x1b\\");
+            try g.word(8 + g.below(16));
+            try g.put("\x1b]8;;\x1b\\ ");
+        },
+        6 => {
+            try g.put("\x1b]0;");
+            try g.word(60 + g.below(140));
+            try g.put("\x07");
+        },
+        7 => {
+            try g.put("\x1b]133;A\x07\x1b]7;file://host/home/user/");
+            try g.word(40 + g.below(80));
+            try g.put("\x1b\\\x1b]133;B\x07$ ");
+            try g.word(10);
+            try g.put("\x1b]133;C\x07\r\n\x1b]133;D;0\x07");
+        },
+        8 => {
+            var raw: [3072]u8 = undefined;
+            const n = 1024 + g.below(2048);
+            for (raw[0..n]) |*b| b.* = @truncate(g.next());
+            var enc: [4096]u8 = undefined;
+            try g.put("\x1b]52;c;");
+            try g.put(std.base64.standard.Encoder.encode(&enc, raw[0..n]));
+            try g.put("\x07");
+        },
+        else => try g.put("\r\n"),
+    }
+}
+
+fn genKitty(g: *Gen) !void {
+    const side = 64;
+    const id = 1 + g.n % 16;
+    var rgba: [side * side * 4]u8 = undefined;
+    for (0..side) |y| for (0..side) |x| {
+        const p = (y * side + x) * 4;
+        rgba[p..][0..4].* = .{ @intCast(x * 4), @intCast(y * 4), @truncate(id * 16), 255 };
+    };
+    var enc: [std.base64.standard.Encoder.calcSize(rgba.len)]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&enc, &rgba);
+    var off: usize = 0;
+    while (off < b64.len) {
+        const end = @min(off + 4096, b64.len);
+        const more: u8 = if (end < b64.len) 1 else 0;
+        if (off == 0) {
+            try g.fmt("\x1b_Ga=T,f=32,s={d},v={d},i={d},q=2,m={d};", .{ side, side, id, more });
+        } else try g.fmt("\x1b_Gm={d};", .{more});
+        try g.put(b64[off..end]);
+        try g.put("\x1b\\");
+        off = end;
+    }
+    try g.put("\r\n");
+    for (0..4) |_| try genAscii(g);
+}
+
+fn genSixel(g: *Gen) !void {
+    const side = 64;
+    const seed = g.n % 8;
+    try g.fmt("\x1bPq\"1;1;{d};{d}", .{ side, side });
+    for (0..8) |c| try g.fmt("#{d};2;{d};{d};{d}", .{ c, (c * 37) % 101, (c * 53) % 101, (c * 71) % 101 });
+    var band: usize = 0;
+    while (band < side) : (band += 6) {
+        for (0..8) |c| {
+            try g.fmt("#{d}", .{c});
+            var x: usize = 0;
+            while (x < side) {
+                const bits = sixelBits(band, x, c, seed);
+                var run: usize = 1;
+                while (x + run < side and sixelBits(band, x + run, c, seed) == bits) run += 1;
+                const ch: u8 = '?' + @as(u8, bits);
+                if (run > 3) try g.fmt("!{d}{c}", .{ run, ch }) else for (0..run) |_| try g.out.append(g.gpa, ch);
+                x += run;
+            }
+            try g.put(if (c == 7) "-" else "$");
+        }
+    }
+    try g.put("\x1b\\\r\n");
+    for (0..4) |_| try genAscii(g);
+}
+
+fn sixelBits(band: usize, x: usize, color: usize, seed: usize) u6 {
+    var bits: u6 = 0;
+    for (0..6) |dy| {
+        const y = band + dy;
+        if ((x / 8 + y / 8 + seed) % 8 == color) bits |= @as(u6, 1) << @intCast(dy);
+    }
+    return bits;
+}
+
+// ---------------------------------------------------------------- PTY pipeline
+
+const Pty = struct {
+    master: linux.fd_t,
+    slave: linux.fd_t,
+
+    /// /dev/ptmx + TIOCGPTPEER; slave raw (no ONLCR, no echo) so bytes arrive verbatim.
+    fn open() !Pty {
+        const m = linux.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .NONBLOCK = true, .CLOEXEC = true }, 0);
+        if (linux.errno(m) != .SUCCESS) return error.PtyOpen;
+        const master: linux.fd_t = @intCast(m);
+        errdefer _ = linux.close(master);
+        var unlock: c_int = 0;
+        if (linux.errno(linux.ioctl(master, linux.T.IOCSPTLCK, @intFromPtr(&unlock))) != .SUCCESS) return error.PtyOpen;
+        const flags: linux.O = .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true };
+        const s = linux.ioctl(master, linux.T.IOCGPTPEER, @as(u32, @bitCast(flags)));
+        if (linux.errno(s) != .SUCCESS) return error.PtyOpen;
+        const slave: linux.fd_t = @intCast(s);
+        errdefer _ = linux.close(slave);
+        var t = try posix.tcgetattr(slave);
+        t.iflag = .{};
+        t.oflag = .{};
+        t.lflag = .{};
+        t.cflag.CSIZE = .CS8;
+        t.cflag.PARENB = false;
+        try posix.tcsetattr(slave, .NOW, t);
+        return .{ .master = master, .slave = slave };
+    }
+};
+
+fn writerMain(fd: linux.fd_t, bytes: []const u8, failed: *bool) void {
+    var rest = bytes;
+    while (rest.len != 0) {
+        const rc = linux.write(fd, rest.ptr, rest.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => rest = rest[rc..],
+            .INTR, .AGAIN => {},
+            else => {
+                failed.* = true;
+                return;
+            },
+        }
+    }
+}
+
+const Stage = enum { io, scan, vt, render, present };
+const stage_count = std.enums.values(Stage).len;
+
+const Pipeline = struct {
     ring: CircBuffer,
     term: VtState,
     frame: Draw.Frame,
-    copy_pixels: []u32,
-    type_ctx: ?*Type.Context,
-    cell_w: u32,
-    cell_h: u32,
-    base_cols: u16,
-    base_rows: u16,
-    payload: []const u8 = &.{},
-    sel: Select.State = .{},
-    checksum: u64 = 0,
-    query_acc: u64 = 0,
-    pipeline_fed: usize = 0,
-    pipeline_scanned: u64 = 0,
-    pipeline_chunks: usize = 0,
-    max_unread: u64 = 0,
-    bitmap: ?Type.TrueType.Bitmap = null,
-    atlas: ?Type.Atlas = null,
-    glyph_id: u16 = 0,
+    present: []u32,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, cols: u16, rows: u16, cw: u32, ch: u32, ctx: ?*Type.Context) !Work {
-        var ring = try CircBuffer.create(allocator, ring_cap);
+    fn init(env: *const Env, cols: u16, rows: u16) !Pipeline {
+        var ring = try CircBuffer.create(env.gpa, ring_cap);
         errdefer ring.destroy();
-        var term = try VtState.init(allocator, cols, rows, @max(1000, @as(u32, rows) * 2), ring.storage);
+        var term = try VtState.init(env.gpa, cols, rows, scrollback, ring.storage);
         errdefer term.deinit();
-        var frame = try Draw.Frame.init(allocator, @as(u32, cols) * cw, @as(u32, rows) * ch);
+        var frame = try Draw.Frame.init(env.gpa, @as(u32, cols) * env.cell_w, @as(u32, rows) * env.cell_h);
         errdefer frame.deinit();
-        const copy_pixels = try allocator.alloc(u32, frame.pixels.len);
-        @memset(copy_pixels, 0);
-        return .{ .allocator = allocator, .io = io, .ring = ring, .term = term, .frame = frame, .copy_pixels = copy_pixels, .type_ctx = ctx, .cell_w = cw, .cell_h = ch, .base_cols = cols, .base_rows = rows };
+        const present = try env.gpa.alloc(u32, frame.pixels.len);
+        @memset(present, 0);
+        return .{ .ring = ring, .term = term, .frame = frame, .present = present };
     }
 
-    fn deinit(self: *Work) void {
-        if (self.bitmap) |bmp| self.allocator.free(bmp.pixels);
-        if (self.atlas) |*a| a.deinit();
-        self.allocator.free(self.copy_pixels);
+    fn deinit(self: *Pipeline, gpa: std.mem.Allocator) void {
+        gpa.free(self.present);
         self.frame.deinit();
         self.term.deinit();
         self.ring.destroy();
     }
 
-    fn loadPayload(self: *Work) void {
-        self.ring.head = 0;
-        self.ring.tail = 0;
-        self.ring.hold_at_head = 0;
-        ingest(&self.ring, self.payload);
+    /// main.zig Presenter: copy only the damaged rows to the window buffer.
+    fn presentDamage(self: *Pipeline) void {
+        if (!self.frame.damaged()) return;
+        const y0: usize = if (self.frame.dirty_full) 0 else self.frame.dirty_y;
+        const h: usize = if (self.frame.dirty_full) self.frame.height else self.frame.dirty_h;
+        const w = self.frame.width;
+        @memcpy(self.present[y0 * w ..][0 .. h * w], self.frame.pixels[y0 * w ..][0 .. h * w]);
+        std.mem.doNotOptimizeAway(self.present);
     }
 
-    fn prepare(self: *Work, op: Operation) !void {
-        self.sel = .{};
-        self.query_acc = 0;
-        self.loadPayload();
-        switch (op) {
-            .runs_all, .runs_last => self.ring.consumeAndPreparse(),
-            .vt_all, .vt_last => {
-                _ = self.ring.consumeAndGetRuns(if (op == .vt_last) 24 else std.math.maxInt(usize));
-            },
-            .pipeline => {
-                self.ring.head = 0;
-                self.ring.tail = 0;
-                self.term.reset();
-                self.frame.invalidate();
-            },
-            .full, .skip, .single, .line, .cursor, .selection, .scroll, .resize, .copy, .memset => {
-                try self.term.resize(self.base_cols, self.base_rows);
-                try self.frame.resize(@as(u32, self.base_cols) * self.cell_w, @as(u32, self.base_rows) * self.cell_h);
-                fillScreen(&self.term);
-                // Isolate dirty-cell/selection/scroll work from cursor movement.
-                self.term.flags.cursor_visible = op == .cursor;
-                self.frame.invalidate();
-                self.frame.render(&self.term, self.cell_w, self.cell_h, self.type_ctx, size_px);
-                self.term.clearDirty();
-            },
-            .glyph_ascii, .glyph_lru, .peek_lru, .atlas_reset, .raster, .atlas => {
-                const ctx = self.type_ctx.?;
-                var cp: u21 = 32;
-                while (cp < 127) : (cp += 1) _ = try ctx.glyph(cp, size_px);
-                for (lru_cps) |c| _ = try ctx.glyph(c, size_px);
-                ctx.stats = .{};
-                if (op == .raster or op == .atlas) {
-                    const font = ctx.faces.items[0].font;
-                    self.glyph_id = (try font.glyphIndex('A')) orelse return error.GlyphNotFound;
-                    if (self.bitmap == null) self.bitmap = try font.rasterize(self.allocator, self.glyph_id, size_px);
-                    if (self.bitmap.?.width == 0 or self.bitmap.?.height == 0 or self.bitmap.?.color) return error.InvalidRasterBitmap;
-                    if (self.atlas == null) self.atlas = try Type.Atlas.init(self.allocator, 1024, 1024);
-                    self.atlas.?.clear();
-                }
-            },
-            else => {},
-        }
-    }
-
-    // Mutations/reset are excluded for isolated stages. resize and pipeline include
-    // their mutations, allocations/reflow, and render/copy in the timed operation.
-    fn prepareIteration(self: *Work, op: Operation, i: u32) void {
-        const cp: u21 = if (i % 2 == 0) '#' else '@';
-        switch (op) {
-            .lines, .parse_all, .parse_last => {
-                self.ring.tail = 0;
-                self.ring.hold_at_head = 0;
-            },
-            .vt_all, .vt_last => self.term.reset(),
-            .full => {
-                self.frame.invalidate();
-                self.term.markDirtyAll();
-            },
-            .skip, .single, .line, .cursor, .selection, .scroll => {
-                self.term.clearDirty();
-                const row = self.term.rows / 2;
-                if (op == .single or op == .line) {
-                    self.term.grid().cursor = .{ .row = row, .col = 0 };
-                    self.term.grid().wrap_pending = false;
-                    const count: u16 = if (op == .single) 1 else self.term.cols;
-                    var col: u16 = 0;
-                    while (col < count) : (col += 1) self.term.printCodepoint(cp);
-                } else if (op == .cursor) {
-                    self.term.grid().cursor = .{ .row = row, .col = @intCast(i % self.term.cols) };
-                    self.term.grid().wrap_pending = false;
-                } else if (op == .selection) {
-                    self.sel.begin(0, row);
-                    self.sel.extend(@intCast(1 + i % (self.term.cols - 1)), row + 1);
-                } else if (op == .scroll) {
-                    // ESC D equivalent: one-row full-screen index followed by
-                    // distinct new text. Cursor at bottom ensures real scrolling.
-                    self.term.grid().cursor = .{ .row = self.term.rows - 1, .col = 0 };
-                    self.term.grid().wrap_pending = false;
-                    self.term.index();
-                    self.term.printCodepoint(cp);
-                }
-            },
-            .atlas => {
-                const bmp = self.bitmap.?;
-                const a = &self.atlas.?;
-                // Capacity maintenance excluded from isolated pack+blit.
-                if (a.shelf_y + a.shelf_h + bmp.height > a.height) a.clear();
-            },
-            else => {},
-        }
-    }
-
-    fn perform(self: *Work, op: Operation, i: u32) !void {
-        switch (op) {
-            .ingest => {
-                ingest(&self.ring, self.payload);
-                std.mem.doNotOptimizeAway(self.ring.storage);
-            },
-            .firehose => {
-                // Each copy observed; this deliberately retains only the last ring.
-                var n: usize = 0;
-                while (n < 4 * 1024 * 1024) {
-                    const count = @min(self.payload.len, 4 * 1024 * 1024 - n);
-                    ingest(&self.ring, self.payload[0..count]);
-                    std.mem.doNotOptimizeAway(self.ring.storage);
-                    n += count;
-                }
-            },
-            .lines => self.ring.consumeAndPreparse(),
-            .runs_all => self.ring.splitIntoRuns(self.ring.lines.items),
-            .runs_last => self.ring.splitIntoRuns(self.ring.getLastNLines(24)),
-            .parse_all, .parse_last => {
-                _ = self.ring.consumeAndGetRuns(if (op == .parse_last) 24 else std.math.maxInt(usize));
-            },
-            .vt_all, .vt_last => self.term.feedRuns(self.ring.runs.items),
-            .pipeline => try self.pipeline(),
-            .width_ascii, .width_bmp, .width_cjk => {
-                var cp: u21 = if (op == .width_cjk) 0x4E00 else 0;
-                const end: u21 = switch (op) {
-                    .width_ascii => 128,
-                    .width_bmp => 0x3000,
-                    else => 0x4E00 + 4096,
-                };
-                // Prevent loop-invariant constant-query elimination/hoisting.
-                while (cp < end) : (cp += 1) {
-                    std.mem.doNotOptimizeAway(&cp);
-                    self.query_acc +%= EastAsian.cellWidth(cp);
-                }
-            },
-            .full, .skip, .single, .line, .cursor, .selection, .scroll => {
-                self.frame.renderSel(&self.term, self.cell_w, self.cell_h, self.type_ctx, size_px, self.sel);
-                std.mem.doNotOptimizeAway(self.frame.pixels);
-            },
-            .resize => {
-                const cols = self.base_cols + @as(u16, @intCast(1 - i % 2));
-                try self.term.resize(cols, self.base_rows);
-                try self.frame.resize(@as(u32, cols) * self.cell_w, @as(u32, self.base_rows) * self.cell_h);
-                self.frame.render(&self.term, self.cell_w, self.cell_h, self.type_ctx, size_px);
-                self.term.clearDirty();
-                std.mem.doNotOptimizeAway(self.frame.pixels);
-            },
-            .copy => {
-                @memcpy(self.copy_pixels, self.frame.pixels);
-                std.mem.doNotOptimizeAway(self.copy_pixels);
-            },
-            .memset => {
-                @memset(self.frame.pixels, i);
-                std.mem.doNotOptimizeAway(self.frame.pixels);
-            },
-            .glyph_ascii => {
-                var cp: u21 = 32;
-                while (cp < 127) : (cp += 1) {
-                    std.mem.doNotOptimizeAway(&cp);
-                    const g = try self.type_ctx.?.glyph(cp, size_px);
-                    self.query_acc +%= g.glyph_id;
-                    std.mem.doNotOptimizeAway(g);
-                }
-            },
-            .glyph_lru, .peek_lru => {
-                for (lru_cps) |codepoint| {
-                    var cp = codepoint;
-                    std.mem.doNotOptimizeAway(&cp);
-                    const g = if (op == .glyph_lru) try self.type_ctx.?.glyph(cp, size_px) else self.type_ctx.?.peekGlyph(cp, size_px) orelse return error.CacheNotWarm;
-                    self.query_acc +%= g.glyph_id;
-                    std.mem.doNotOptimizeAway(g);
-                }
-            },
-            .atlas_reset => {
-                self.type_ctx.?.clearAtlas();
-                std.mem.doNotOptimizeAway(self.type_ctx.?.atlas.pixels);
-            },
-            .raster => {
-                const bmp = try self.type_ctx.?.faces.items[0].font.rasterize(self.allocator, self.glyph_id, size_px);
-                std.mem.doNotOptimizeAway(bmp.pixels);
-                // Retain this output for a checksum after the timed batch;
-                // allocation and freeing the previous same-sized bitmap are timed.
-                self.allocator.free(self.bitmap.?.pixels);
-                self.bitmap = bmp;
-            },
-            .atlas => {
-                const bmp = self.bitmap.?;
-                const a = &self.atlas.?;
-                const rect = a.pack(bmp.width, bmp.height) orelse return error.AtlasFull;
-                a.blit(rect, bmp.pixels);
-                std.mem.doNotOptimizeAway(a.pixels);
-            },
-        }
-        // A memory-clobbering barrier per operation makes writes observable even
-        // when a later repetition replaces the same state. No full-frame hashing
-        // is charged to render/copy timings.
-        std.mem.doNotOptimizeAway(self);
-    }
-
-    fn pipeline(self: *Work) !void {
-        self.pipeline_fed = 0;
-        self.pipeline_scanned = 0;
-        self.pipeline_chunks = 0;
-        self.max_unread = 0;
-        var off: usize = 0;
-        while (off < self.payload.len) {
-            // 4093 intentionally cuts CRLF/UTF8/controls at changing boundaries.
-            const end = @min(off + 4093, self.payload.len);
-            ingest(&self.ring, self.payload[off..end]);
-            const unread = self.ring.head - self.ring.tail;
-            if (unread > self.ring.capacity) return error.PipelineOverrun;
-            self.max_unread = @max(self.max_unread, unread);
-            self.pipeline_scanned += unread;
-            const runs = self.ring.consumeAndGetRuns(std.math.maxInt(usize));
-            self.pipeline_fed += runBytes(&self.ring);
-            self.term.feedRuns(runs);
-            self.frame.render(&self.term, self.cell_w, self.cell_h, self.type_ctx, size_px);
-            self.term.clearDirty();
-            @memcpy(self.copy_pixels, self.frame.pixels);
-            std.mem.doNotOptimizeAway(self.copy_pixels);
-            self.pipeline_chunks += 1;
-            off = end;
-        }
-        if (self.pipeline_fed != self.payload.len or self.ring.tail != self.ring.head) return error.PipelineByteMismatch;
-    }
-
-    fn observe(self: *Work, op: Operation) void {
-        var h: u64 = self.query_acc;
-        switch (op) {
-            .ingest, .firehose => {
-                const start: usize = @intCast((self.ring.head - @min(self.ring.head, self.ring.capacity)) & (self.ring.capacity - 1));
-                h ^= hashBytes(self.ring.storage[start..][0..@intCast(@min(self.ring.head, self.ring.capacity))]);
-            },
-            .lines => {
-                for (self.ring.lines.items) |line| h = (h *% 16777619) ^ line.off ^ line.len;
-            },
-            .runs_all, .runs_last, .parse_all, .parse_last => {
-                for (self.ring.runs.items) |r| h = (h *% 16777619) ^ r.off ^ r.len ^ @intFromEnum(r.kind);
-            },
-            .vt_all, .vt_last => h ^= hashTerm(&self.term),
-            .pipeline => h ^= hashTerm(&self.term) ^ hashBytes(std.mem.sliceAsBytes(self.copy_pixels)),
-            .copy => h ^= hashBytes(std.mem.sliceAsBytes(self.copy_pixels)),
-            .full, .skip, .single, .line, .cursor, .selection, .scroll, .resize, .memset => h ^= hashBytes(std.mem.sliceAsBytes(self.frame.pixels)),
-            .raster => h ^= hashBytes(self.bitmap.?.pixels),
-            .atlas => h ^= hashBytes(self.atlas.?.pixels),
-            .atlas_reset => h ^= hashBytes(self.type_ctx.?.atlas.pixels),
-            else => {},
-        }
-        self.checksum = (self.checksum *% 0x100000001b3) ^ h;
-        std.mem.doNotOptimizeAway(self.checksum);
+    /// What main.zig hands to the window between frames; not timed.
+    fn drainHost(self: *Pipeline) void {
+        const t = &self.term;
+        t.reply.clearRetainingCapacity();
+        t.title_dirty = false;
+        t.app_id_dirty = false;
+        t.pointer_dirty = false;
+        t.notify_pending = false;
+        t.clip_kind = 0;
+        t.clip.clearRetainingCapacity();
     }
 };
 
-fn renderSuite(log: *Log, opt: Options, work: *Work, iterations: u32) !void {
-    try log.print("\nrender {d}x{d}: framebuffer={d}x{d} ({d} B); {d} iterations/batch\n", .{
-        work.base_cols, work.base_rows, work.frame.width, work.frame.height, work.frame.pixels.len * 4, iterations,
-    });
-    try log.print("  Warm glyph cache/snapshot; cursor hidden except cursor case. Dirty scenarios mutate before timing; resize includes reflow/alloc/render.\n  Damage is a bounding band, NOT exact painted pixel bytes.\n", .{});
-    const cases = [_]struct { op: Operation, name: []const u8 }{
-        .{ .op = .full, .name = "full repaint (invalidate)" },
-        .{ .op = .skip, .name = "no-change render" },
-        .{ .op = .single, .name = "single-cell dirty render" },
-        .{ .op = .line, .name = "one-line dirty render" },
-        .{ .op = .cursor, .name = "cursor-move render" },
-        .{ .op = .selection, .name = "selection-change render" },
-        .{ .op = .scroll, .name = "one-row scroll render" },
-        .{ .op = .resize, .name = "resize +/-1 col + render" },
-    };
-    for (cases) |case| try run(log, opt, work, case.op, case.name, .frames, 1, iterations);
-    // Resize changes frame length; restore it before the fixed-size copy tests.
-    try work.term.resize(work.base_cols, work.base_rows);
-    try work.frame.resize(@as(u32, work.base_cols) * work.cell_w, @as(u32, work.base_rows) * work.cell_h);
-    try run(log, opt, work, .copy, "CPU framebuffer memcpy", .bytes, work.copy_pixels.len * 4, iterations);
-    try run(log, opt, work, .memset, "CPU framebuffer memset", .bytes, work.copy_pixels.len * 4, iterations);
-    try log.print("  render-suite checksum={x}\n", .{work.checksum});
-}
+fn runPipeline(log: *Log, env: *Env, wl: Workload, bytes: []const u8) !void {
+    const gpa = env.gpa;
+    const opt = env.opt;
+    const burst: usize = @as(usize, opt.burst_kib) * 1024;
+    const frames = (bytes.len + burst - 1) / burst;
+    const warm = @min(16, frames / 10);
+    var p = try Pipeline.init(env, opt.cols, opt.rows);
+    defer p.deinit(gpa);
+    if (env.ctx) |c| c.clearAtlas();
+    const misses0 = if (env.ctx) |c| c.stats.misses else 0;
 
-const Summary = struct { min: f64, median: f64, p95: f64, max: f64 };
-fn summarize(values: []f64) Summary {
-    std.mem.sort(f64, values, {}, std.sort.asc(f64));
-    const n = values.len;
-    return .{
-        .min = values[0],
-        .median = if (n % 2 == 0) (values[n / 2 - 1] + values[n / 2]) / 2 else values[n / 2],
-        .p95 = values[(n * 95 + 99) / 100 - 1],
-        .max = values[n - 1],
-    };
-}
+    var stage_ns: [stage_count][]u64 = undefined;
+    for (&stage_ns) |*s| s.* = try gpa.alloc(u64, frames);
+    defer for (stage_ns) |s| gpa.free(s);
+    const total_ns = try gpa.alloc(u64, frames);
+    defer gpa.free(total_ns);
+    var wait_ns: u64 = 0;
+    var reads: u64 = 0;
+    var runs: u64 = 0;
 
-fn run(log: *Log, opt: Options, work: *Work, op: Operation, name: []const u8, metric: Metric, units: usize, iterations: u32) !void {
-    var samples: [100]f64 = undefined;
-    var damage: u64 = 0;
-    var fill_ns: u64 = 0;
-    var glyph_ns: u64 = 0;
-    var batch: u32 = 0;
-    while (batch < opt.warmup + opt.samples) : (batch += 1) {
-        try work.prepare(op);
-        var elapsed: i128 = 0;
-        var i: u32 = 0;
-        while (i < iterations) : (i += 1) {
-            work.prepareIteration(op, i);
-            const start = nowNs(work.io);
-            try work.perform(op, i);
-            elapsed += nowNs(work.io) - start;
-            // Reject incomplete/failed descriptor construction outside the timer.
-            switch (op) {
-                .lines => {
-                    var scanned: usize = 0;
-                    for (work.ring.lines.items) |line| scanned += line.len;
-                    if (scanned != units) return error.LineByteMismatch;
+    const pty = try Pty.open();
+    var write_failed = false;
+    const writer = try std.Thread.spawn(.{}, writerMain, .{ pty.slave, bytes, &write_failed });
+    // Closing the master first unblocks a writer stuck on a full PTY.
+    defer {
+        _ = linux.close(pty.master);
+        writer.join();
+        _ = linux.close(pty.slave);
+    }
+
+    const mask = p.ring.capacity - 1;
+    var fed: usize = 0;
+    for (0..frames) |f| {
+        const want = @min(burst, bytes.len - fed);
+        if (p.ring.head - p.ring.tail + want > p.ring.capacity) return error.RingOverrun;
+        var io_ns: u64 = 0;
+        var got: usize = 0;
+        while (got < want) {
+            const off: usize = @intCast(p.ring.head & mask);
+            const t0 = nowNs();
+            const rc = linux.read(pty.master, p.ring.storage[off..].ptr, want - got);
+            const t1 = nowNs();
+            io_ns += t1 - t0;
+            switch (linux.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return error.PtyEof;
+                    if (!p.ring.mapped) mirror(&p.ring, off, rc);
+                    p.ring.head += rc;
+                    got += rc;
+                    reads += 1;
                 },
-                .runs_all, .runs_last, .parse_all, .vt_all, .vt_last => {
-                    if (runBytes(&work.ring) != units) return error.RunByteMismatch;
+                .AGAIN => {
+                    var pfd = [1]linux.pollfd{.{ .fd = pty.master, .events = linux.POLL.IN, .revents = 0 }};
+                    const rc_poll = linux.poll(&pfd, 1, 5000);
+                    wait_ns += nowNs() - t1;
+                    if (rc_poll == 0 or write_failed) return error.PtyStalled;
                 },
-                .parse_last => try validateParseLast(work, units),
-                .atlas_reset => {
-                    for (work.type_ctx.?.ascii) |glyph| if (glyph == null) return error.IncompleteAsciiPrewarm;
-                },
-                else => {},
-            }
-            if (batch >= opt.warmup and metric == .frames) {
-                damage += if (work.frame.dirty_full) work.frame.height else work.frame.dirty_h;
-                fill_ns += work.frame.last_fill_ns;
-                glyph_ns += work.frame.last_glyph_ns;
-                if (op == .skip and work.frame.damaged()) return error.SkipFrameDamaged;
-                if (op != .skip and !work.frame.damaged()) return error.DirtyFrameNotDamaged;
+                .INTR => {},
+                else => return error.PtyRead,
             }
         }
-        work.observe(op);
-        if (batch >= opt.warmup) samples[batch - opt.warmup] = @as(f64, @floatFromInt(@max(elapsed, 1))) / @as(f64, @floatFromInt(iterations));
+        fed += want;
+        const t0 = nowNs();
+        const r = p.ring.consumeAndGetRuns(std.math.maxInt(usize));
+        runs += r.len;
+        const t1 = nowNs();
+        if (r.len != 0) p.term.feedRuns(r);
+        const t2 = nowNs();
+        p.drainHost();
+        const t3 = nowNs();
+        p.frame.renderSel(&p.term, env.cell_w, env.cell_h, env.ctx, size_px, .{});
+        p.term.clearDirty();
+        const t4 = nowNs();
+        p.presentDamage();
+        const t5 = nowNs();
+        const ns = [stage_count]u64{ io_ns, t1 - t0, t2 - t1, t4 - t3, t5 - t4 };
+        total_ns[f] = 0;
+        for (ns, 0..) |v, i| {
+            stage_ns[i][f] = v;
+            total_ns[f] += v;
+        }
     }
-    const stats = summarize(samples[0..opt.samples]);
-    const spread = (stats.max - stats.min) / stats.median * 100;
-    const divisor: f64 = if (metric == .queries) @floatFromInt(units) else 1;
-    const scale: f64 = if (metric == .queries) 1 else 1_000_000;
-    try log.print("  {s}\n    min={d:.6} median={d:.6} p95={d:.6} max={d:.6} {s} spread={d:.1}%", .{
-        name,                                                                                   stats.min / divisor / scale, stats.median / divisor / scale, stats.p95 / divisor / scale, stats.max / divisor / scale,
-        if (metric == .queries) "ns/query" else if (metric == .frames) "ms/frame" else "ms/op", spread,
+    if (p.ring.head != p.ring.tail) return error.PipelineHeldBytes;
+
+    const kept = frames - warm;
+    try log.print("\npipeline {s}: {s}\n", .{ wl.name, wl.about });
+    try log.print("  bytes={d} frames={d} (+{d} warm discarded) burst={d} B grid={d}x{d} reads/frame={d:.1} runs/frame={d:.0}\n", .{
+        bytes.len - @min(bytes.len, warm * burst), kept, warm, burst, opt.cols, opt.rows,
+        @as(f64, @floatFromInt(reads)) / @as(f64, @floatFromInt(frames)), @as(f64, @floatFromInt(runs)) / @as(f64, @floatFromInt(frames)),
     });
-    if (metric == .bytes) try log.print(" input/copy={d} B/op median={d:.2} MiB/s", .{ units, @as(f64, @floatFromInt(units)) / stats.median * 1_000_000_000 / (1024 * 1024) });
-    if (metric == .queries) try log.print(" queries={d}/op median={d:.2} Mquery/s", .{ units, @as(f64, @floatFromInt(units)) / stats.median * 1000 });
-    try log.print(" checksum={x}\n", .{work.checksum});
-    if (metric == .frames) {
-        const count: f64 = @floatFromInt(opt.samples * iterations);
-        try log.print("    mean damage-band={d:.1} pixel-rows/frame fill={d:.3} glyph={d:.3} ms/frame\n", .{
-            @as(f64, @floatFromInt(damage)) / count, @as(f64, @floatFromInt(fill_ns)) / count / 1_000_000, @as(f64, @floatFromInt(glyph_ns)) / count / 1_000_000,
-        });
+    try log.print("  {s:<8} {s:>10} {s:>10} {s:>10} {s:>7}\n", .{ "stage", "p50 us", "p95 us", "mean us", "share" });
+    const total = percentiles(total_ns[warm..]);
+    var share: [stage_count]f64 = undefined;
+    for (std.enums.values(Stage), 0..) |stage, i| {
+        const s = percentiles(stage_ns[i][warm..]);
+        share[i] = s.sum / total.sum * 100;
+        try log.print("  {s:<8} {d:>10.1} {d:>10.1} {d:>10.1} {d:>6.1}%\n", .{ @tagName(stage), s.p50 / 1000, s.p95 / 1000, s.mean / 1000, share[i] });
     }
-    if (op == .glyph_ascii or op == .glyph_lru) {
-        const stats_g = work.type_ctx.?.stats;
-        try log.print("    last batch hits={d} misses={d} (missing codepoints may use replacement glyph)\n", .{ stats_g.hits, stats_g.misses });
+    const kept_bytes: f64 = @floatFromInt(bytes.len - @min(bytes.len, warm * burst));
+    try log.print("  {s:<8} {d:>10.1} {d:>10.1} {d:>10.1}  {d:.1} MiB/s\n", .{ "frame", total.p50 / 1000, total.p95 / 1000, total.mean / 1000, kept_bytes / (total.sum / 1e9) / (1024 * 1024) });
+    try log.print("  split: io {d:.1}% | parse {d:.1}% (scan {d:.1} + vt {d:.1}) | render {d:.1}% (draw {d:.1} + copy {d:.1})\n", .{
+        share[0], share[1] + share[2], share[1], share[2], share[3] + share[4], share[3], share[4],
+    });
+    const misses = if (env.ctx) |c| c.stats.misses - misses0 else 0;
+    try log.print("  io-wait {d:.1} us/frame (excluded) glyph-misses={d} images={d} placements={d} checksum={x}\n", .{
+        @as(f64, @floatFromInt(wait_ns)) / @as(f64, @floatFromInt(frames)) / 1000, misses, p.term.kitty.images.items.len, p.term.kitty.placements.items.len,
+        hashTerm(&p.term) ^ hashBytes(std.mem.sliceAsBytes(p.frame.pixels)),
+    });
+}
+
+// Same as CircBuffer.syncMirror for the unmapped fallback.
+fn mirror(ring: *CircBuffer, off: usize, n: usize) void {
+    const cap = ring.capacity;
+    const a = ring.storage;
+    const first = @min(n, cap - off);
+    @memcpy(a[off + cap ..][0..first], a[off..][0..first]);
+    const rest = n - first;
+    @memcpy(a[0..rest], a[cap..][0..rest]);
+}
+
+// ---------------------------------------------------------------- glyph cache
+
+const batch = 64;
+
+fn glyphSuite(log: *Log, env: *Env) !void {
+    const ctx = env.ctx.?;
+    const gpa = env.gpa;
+    const samples = env.opt.samples;
+    try log.print("\nglyph cache: ns/lookup over {d}-lookup batches, {d} batches/row; LRU capacity {d}\n", .{ batch, samples, cache_capacity });
+
+    // Distinct drawable glyphs: Latin-ext/Greek/Cyrillic/box/arrows, then CJK.
+    var small: std.ArrayList(u21) = .empty;
+    defer small.deinit(gpa);
+    var cjk: std.ArrayList(u21) = .empty;
+    defer cjk.deinit(gpa);
+    try collect(ctx, gpa, &small, &.{ .{ 0x100, 0x250 }, .{ 0x370, 0x400 }, .{ 0x400, 0x500 }, .{ 0x2190, 0x2200 }, .{ 0x2500, 0x2580 } }, 1024);
+    try collect(ctx, gpa, &cjk, &.{.{ 0x4E00, 0x9FFF }}, 8192);
+    var emoji: std.ArrayList(u21) = .empty;
+    defer emoji.deinit(gpa);
+    if (env.emoji) try collect(ctx, gpa, &emoji, &.{ .{ 0x1F600, 0x1F650 }, .{ 0x1F680, 0x1F6C6 }, .{ 0x1F300, 0x1F3F0 } }, 256);
+    try log.print("  pools: small={d} cjk={d} color-emoji={d} (distinct drawable glyphs)\n", .{ small.items.len, cjk.items.len, emoji.items.len });
+    try log.print("  {s:<38} {s:>9} {s:>9} {s:>9} {s:>7} {s:>7}\n", .{ "case", "p50 ns", "p95 ns", "mean ns", "hit%", "resets" });
+
+    var ascii: [95]u21 = undefined;
+    for (&ascii, 0..) |*c, i| c.* = @intCast(32 + i);
+    try glyphRow(log, env, "glyph() ASCII table", &ascii, .hit_glyph);
+    if (small.items.len >= batch) {
+        const hot = small.items[0..@min(256, small.items.len)];
+        try glyphRow(log, env, "glyph() hit, 256 non-ASCII", hot, .hit_glyph);
+        try glyphRow(log, env, "peekGlyph() hit (render path)", hot, .hit_peek);
+        try glyphRow(log, env, "miss: raster+pack Latin/Greek/box", small.items, .miss);
     }
+    if (cjk.items.len >= 256) {
+        // Fallback-font glyphs: resolve() walks cmaps before the cache key exists.
+        try glyphRow(log, env, "glyph() hit, 256 CJK (fallback face)", cjk.items[0..256], .hit_glyph);
+        try glyphRow(log, env, "peekGlyph() hit, 256 CJK", cjk.items[0..256], .hit_peek);
+        try glyphRow(log, env, "miss: raster+pack CJK", cjk.items, .miss);
+    }
+    if (emoji.items.len >= batch) {
+        try glyphRow(log, env, "miss: color emoji (CBDT decode+scale)", emoji.items, .miss);
+        try glyphRow(log, env, "glyph() hit, color emoji", emoji.items[0..batch], .hit_glyph);
+    }
+
+    // Working-set sweep around the LRU capacity, uniform random access.
+    if (cjk.items.len >= 2 * cache_capacity) {
+        const sets = [_]u32{ cache_capacity / 2, cache_capacity * 9 / 10, cache_capacity * 11 / 10, cache_capacity * 2 };
+        for (sets) |ws| {
+            var name_buf: [64]u8 = undefined;
+            try glyphRow(log, env, try std.fmt.bufPrint(&name_buf, "uniform working set {d}", .{ws}), cjk.items[0..ws], .uniform);
+        }
+        try retention(log, env, cjk.items);
+    } else try log.print("  working-set sweep SKIPPED: needs {d} CJK glyphs (Noto Sans CJK)\n", .{2 * cache_capacity});
+    ctx.clearAtlas();
+}
+
+/// Does a hot set survive a stream of new glyphs (scrolling CJK text)?
+/// A true LRU keeps all 64 hot glyphs (each is touched every 4 lookups);
+/// a cache whose hits do not refresh recency evicts them every `capacity` inserts.
+fn retention(log: *Log, env: *Env, pool: []const u21) !void {
+    const ctx = env.ctx.?;
+    const hot = pool[0..64];
+    const cold = pool[64..];
+    // 1.25x capacity: enough to cycle the LRU, small enough that the atlas
+    // does not fill (a full atlas resets every cache and hides eviction policy).
+    const stream = cache_capacity + cache_capacity / 4;
+    ctx.clearAtlas();
+    for (hot) |cp| _ = try ctx.glyph(cp, size_px);
+    var hot_lookups: u64 = 0;
+    var hot_misses: u64 = 0;
+    var resets: u32 = 0;
+    var shelf = ctx.atlas.shelf_y;
+    for (0..stream) |i| {
+        _ = try ctx.glyph(cold[i % cold.len], size_px);
+        if (ctx.atlas.shelf_y < shelf) resets += 1;
+        shelf = ctx.atlas.shelf_y;
+        if (i % 3 != 2) continue;
+        const before = ctx.stats.misses;
+        _ = try ctx.glyph(hot[hot_lookups % hot.len], size_px);
+        hot_misses += ctx.stats.misses - before;
+        hot_lookups += 1;
+    }
+    try log.print("  hot-64 retention, {d} new glyphs, 3 new : 1 hot -> hot hit {d:.1}% ({d} hot misses, {d} atlas resets; LRU ideal 100%)\n", .{
+        stream, 100 * (1 - @as(f64, @floatFromInt(hot_misses)) / @as(f64, @floatFromInt(hot_lookups))), hot_misses, resets,
+    });
+}
+
+fn collect(ctx: *Type.Context, gpa: std.mem.Allocator, out: *std.ArrayList(u21), ranges: []const [2]u21, max: usize) !void {
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(gpa);
+    ctx.clearAtlas();
+    for (ranges) |r| {
+        var cp = r[0];
+        while (cp < r[1] and out.items.len < max) : (cp += 1) {
+            const g = ctx.glyph(cp, size_px) catch continue;
+            if (g.glyph_id == 0 or g.width == 0) continue;
+            const key = (@as(u64, @intFromEnum(g.font_id)) << 32) | g.glyph_id;
+            if ((try seen.getOrPut(gpa, key)).found_existing) continue;
+            try out.append(gpa, cp);
+        }
+    }
+    ctx.clearAtlas();
+}
+
+const GlyphCase = enum { hit_glyph, hit_peek, miss, uniform };
+
+fn glyphRow(log: *Log, env: *Env, name: []const u8, pool: []const u21, case: GlyphCase) !void {
+    const ctx = env.ctx.?;
+    const samples = env.opt.samples;
+    const ns = try env.gpa.alloc(u64, samples);
+    defer env.gpa.free(ns);
+    var rng: Gen = .{ .gpa = env.gpa };
+    var cursor: usize = 0;
+    var lookups: u64 = 0;
+    var misses: u64 = 0;
+    var resets: u32 = 0;
+    var acc: u64 = 0;
+    ctx.clearAtlas();
+    // Prefill so hits measure a warm cache; sweeps start from a full working set.
+    if (case != .miss) for (pool) |cp| {
+        _ = try ctx.glyph(cp, size_px);
+    };
+    var codes: [batch]u21 = undefined;
+    var warm: u32 = 3;
+    var s: u32 = 0;
+    while (s < samples) {
+        for (&codes, 0..) |*c, i| c.* = switch (case) {
+            .hit_glyph, .hit_peek, .miss => pool[(cursor + i) % pool.len],
+            .uniform => pool[rng.below(pool.len)],
+        };
+        if (case == .miss) {
+            // Fresh atlas per batch; ASCII re-warm is outside the timer.
+            ctx.clearAtlas();
+            cursor = (cursor + batch) % pool.len;
+        } else if (case != .uniform) cursor = (cursor + batch) % pool.len;
+        const before = ctx.stats.misses;
+        const shelf = ctx.atlas.shelf_y;
+        const t0 = nowNs();
+        for (codes) |cp| {
+            const g = if (case == .hit_peek) ctx.peekGlyph(cp, size_px) orelse return error.CacheNotWarm else try ctx.glyph(cp, size_px);
+            acc +%= g.glyph_id;
+        }
+        const t1 = nowNs();
+        std.mem.doNotOptimizeAway(acc);
+        if (ctx.atlas.shelf_y < shelf) resets += 1;
+        if (warm > 0) {
+            warm -= 1;
+            continue;
+        }
+        ns[s] = t1 - t0;
+        lookups += batch;
+        misses += ctx.stats.misses - before;
+        s += 1;
+    }
+    const p = percentiles(ns);
+    const hit = 100 * (1 - @as(f64, @floatFromInt(misses)) / @as(f64, @floatFromInt(lookups)));
+    try log.print("  {s:<38} {d:>9.1} {d:>9.1} {d:>9.1} {d:>6.1}% {d:>7}\n", .{ name, p.p50 / batch, p.p95 / batch, p.mean / batch, hit, resets });
+}
+
+// ---------------------------------------------------------------- render
+
+const RenderCase = enum { full, skip, single, line, cursor, selection, scroll, resize };
+
+fn renderSuite(log: *Log, env: *Env, cols: u16, rows: u16, samples: u32) !void {
+    var p = try Pipeline.init(env, cols, rows);
+    defer p.deinit(env.gpa);
+    try log.print("\nrender {d}x{d} ({d}x{d} px), {d} frames/row; mutation untimed except resize\n", .{ cols, rows, p.frame.width, p.frame.height, samples });
+    try log.print("  {s:<24} {s:>10} {s:>10} {s:>10} {s:>10}\n", .{ "case", "p50 us", "p95 us", "mean us", "rows/frame" });
+    const ns = try env.gpa.alloc(u64, samples);
+    defer env.gpa.free(ns);
+    for (std.enums.values(RenderCase)) |case| {
+        try p.term.resize(cols, rows);
+        try p.frame.resize(@as(u32, cols) * env.cell_w, @as(u32, rows) * env.cell_h);
+        fillScreen(&p.term);
+        p.term.flags.cursor_visible = case == .cursor;
+        p.frame.invalidate();
+        p.frame.render(&p.term, env.cell_w, env.cell_h, env.ctx, size_px);
+        p.term.clearDirty();
+        var sel: Select.State = .{};
+        var damage: u64 = 0;
+        for (0..samples + 2) |i| {
+            const cp: u21 = if (i % 2 == 0) '#' else '@';
+            const row = rows / 2;
+            switch (case) {
+                .full => {
+                    p.frame.invalidate();
+                    p.term.markDirtyAll();
+                },
+                .skip => {},
+                .single, .line => {
+                    p.term.grid().cursor = .{ .row = row, .col = 0 };
+                    p.term.grid().wrap_pending = false;
+                    const n: u16 = if (case == .single) 1 else cols;
+                    for (0..n) |_| p.term.printCodepoint(cp);
+                },
+                .cursor => {
+                    p.term.grid().cursor = .{ .row = row, .col = @intCast(i % cols) };
+                    p.term.grid().wrap_pending = false;
+                },
+                .selection => {
+                    sel.begin(0, row);
+                    sel.extend(@intCast(1 + i % (cols - 1)), row + 1);
+                },
+                .scroll => {
+                    p.term.grid().cursor = .{ .row = rows - 1, .col = 0 };
+                    p.term.grid().wrap_pending = false;
+                    p.term.index();
+                    p.term.printCodepoint(cp);
+                },
+                .resize => {},
+            }
+            const t0 = nowNs();
+            if (case == .resize) {
+                const c = cols + @as(u16, @intCast(1 - i % 2));
+                try p.term.resize(c, rows);
+                try p.frame.resize(@as(u32, c) * env.cell_w, @as(u32, rows) * env.cell_h);
+            }
+            p.frame.renderSel(&p.term, env.cell_w, env.cell_h, env.ctx, size_px, sel);
+            const t1 = nowNs();
+            std.mem.doNotOptimizeAway(p.frame.pixels);
+            if ((case == .skip) == p.frame.damaged()) return error.UnexpectedDamage;
+            p.term.clearDirty();
+            if (i < 2) continue; // warm
+            ns[i - 2] = t1 - t0;
+            damage += if (p.frame.dirty_full) p.frame.height else p.frame.dirty_h;
+        }
+        const s = percentiles(ns);
+        try log.print("  {s:<24} {d:>10.1} {d:>10.1} {d:>10.1} {d:>10.0}\n", .{ @tagName(case), s.p50 / 1000, s.p95 / 1000, s.mean / 1000, @as(f64, @floatFromInt(damage)) / @as(f64, @floatFromInt(samples)) });
+    }
+    try p.term.resize(cols, rows);
+    try p.frame.resize(@as(u32, cols) * env.cell_w, @as(u32, rows) * env.cell_h);
+    for (0..samples) |i| {
+        const t0 = nowNs();
+        @memcpy(p.present, p.frame.pixels);
+        std.mem.doNotOptimizeAway(p.present);
+        ns[i] = nowNs() - t0;
+    }
+    const s = percentiles(ns);
+    try log.print("  {s:<24} {d:>10.1} {d:>10.1} {d:>10.1}  {d:.0} MiB/s\n", .{ "present copy", s.p50 / 1000, s.p95 / 1000, s.mean / 1000, @as(f64, @floatFromInt(p.present.len * 4)) / (s.p50 / 1e9) / (1024 * 1024) });
 }
 
 fn fillScreen(term: *VtState) void {
@@ -669,48 +943,12 @@ fn fillScreen(term: *VtState) void {
     term.grid().wrap_pending = false;
 }
 
-fn makePayload(allocator: std.mem.Allocator, unit: []const u8) ![]u8 {
-    const n = ring_cap / unit.len * unit.len;
-    const payload = try allocator.alloc(u8, n);
-    var off: usize = 0;
-    while (off < n) : (off += unit.len) @memcpy(payload[off..][0..unit.len], unit);
-    return payload;
-}
+// ---------------------------------------------------------------- environment
 
-// Same write/mirror contract as readPTYPump, but explicitly synthetic memory IO.
-fn ingest(buf: *CircBuffer, src: []const u8) void {
-    var rest = src;
-    while (rest.len != 0) {
-        const off: usize = @intCast(buf.head & (buf.capacity - 1));
-        const n = @min(buf.capacity, rest.len);
-        @memcpy(buf.storage[off..][0..n], rest[0..n]);
-        if (!buf.mapped) {
-            const first = @min(n, buf.capacity - off);
-            @memcpy(buf.storage[off + buf.capacity ..][0..first], buf.storage[off..][0..first]);
-            const extra = n - first;
-            @memcpy(buf.storage[0..extra], buf.storage[buf.capacity..][0..extra]);
-        }
-        buf.head += n;
-        rest = rest[n..];
-    }
-}
-
-fn runBytes(buf: *const CircBuffer) usize {
-    var n: usize = 0;
-    for (buf.runs.items) |r| n += r.len;
-    return n;
-}
-fn validateParseLast(work: *const Work, scanned_units: usize) !void {
-    var scanned: usize = 0;
-    for (work.ring.lines.items) |line| scanned += line.len;
-    if (scanned != scanned_units) return error.LineByteMismatch;
-    var selected: usize = 0;
-    for (work.ring.getLastNLines(24)) |line| selected += line.len;
-    if (runBytes(&work.ring) != selected) return error.SelectedRunByteMismatch;
-}
 fn hashBytes(bytes: []const u8) u64 {
     return std.hash.Wyhash.hash(0, bytes);
 }
+
 fn hashTerm(term: *const VtState) u64 {
     var h: u64 = 0;
     var r: u16 = 0;
@@ -718,60 +956,97 @@ fn hashTerm(term: *const VtState) u64 {
     const c = term.cursor();
     return h ^ (@as(u64, c.row) << 32) ^ c.col;
 }
-fn nowNs(io: std.Io) i128 {
-    return std.Io.Timestamp.now(io, .awake).nanoseconds;
+
+const Font = struct { path: []u8, bytes: []u8 };
+
+fn loadFonts(io: std.Io, gpa: std.mem.Allocator, override: ?[]const u8, out: *std.ArrayList(Font)) !void {
+    if (override) |path| {
+        const bytes = loadFile(io, gpa, path) catch |err| {
+            std.debug.print("bench: font {s}: {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
+        try out.append(gpa, .{ .path = try gpa.dupe(u8, path), .bytes = bytes });
+    } else if (fcMatch(io, gpa, "monospace")) |path| {
+        if (loadFile(io, gpa, path)) |bytes| {
+            try out.append(gpa, .{ .path = path, .bytes = bytes });
+        } else |_| gpa.free(path);
+    }
+    if (out.items.len == 0) for (font_paths) |path| {
+        const bytes = loadFile(io, gpa, path) catch continue;
+        try out.append(gpa, .{ .path = try gpa.dupe(u8, path), .bytes = bytes });
+        break;
+    };
+    if (out.items.len == 0) return;
+    for (fallback_paths) |path| {
+        if (std.mem.eql(u8, path, out.items[0].path)) continue;
+        const bytes = loadFile(io, gpa, path) catch continue;
+        try out.append(gpa, .{ .path = try gpa.dupe(u8, path), .bytes = bytes });
+    }
 }
 
-const Font = struct { path: []const u8, bytes: []u8 };
-fn loadFont(io: std.Io, allocator: std.mem.Allocator, override: ?[]const u8) !?Font {
-    if (override) |path| return .{ .path = path, .bytes = loadFile(io, allocator, path, 64 * 1024 * 1024) catch |err| {
-        std.debug.print("bench: font {s}: {s}\n", .{ path, @errorName(err) });
-        return err;
-    } };
-    for (font_paths) |path| {
-        const bytes = loadFile(io, allocator, path, 64 * 1024 * 1024) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => {
-                std.debug.print("bench: font candidate {s}: {s}\n", .{ path, @errorName(err) });
-                return err;
-            },
-        };
-        return .{ .path = path, .bytes = bytes };
+fn fcMatch(io: std.Io, gpa: std.mem.Allocator, pattern: []const u8) ?[]u8 {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "fc-match", "-f", "%{file}", pattern },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
     }
-    return null;
+    const path = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (path.len == 0 or path[0] != '/') return null;
+    return gpa.dupe(u8, path) catch null;
 }
-fn loadFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+
+fn loadFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const len = try file.length(io);
-    if (len > limit) return error.FileTooLarge;
-    const bytes = try allocator.alloc(u8, @intCast(len));
-    errdefer allocator.free(bytes);
+    if (len > 64 * 1024 * 1024) return error.FileTooLarge;
+    const bytes = try gpa.alloc(u8, @intCast(len));
+    errdefer gpa.free(bytes);
     if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.ShortRead;
     return bytes;
 }
 
-fn machineInfo(log: *Log, allocator: std.mem.Allocator, io: std.Io) !void {
-    // procfs files report length zero, so use a bounded positional read.
-    const file = std.Io.Dir.openFileAbsolute(io, "/proc/cpuinfo", .{}) catch |err| {
-        try log.print("cpu info unavailable: {s}\n", .{@errorName(err)});
-        return;
-    };
+fn readSmall(io: std.Io, path: []const u8, buf: []u8) ?[]const u8 {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer file.close(io);
-    const data = try allocator.alloc(u8, 64 * 1024);
-    defer allocator.free(data);
-    const n = file.readPositionalAll(io, data, 0) catch |err| {
-        try log.print("cpu info unavailable: {s}\n", .{@errorName(err)});
-        return;
+    // procfs/sysfs report length zero; use a bounded positional read.
+    const n = file.readPositionalAll(io, buf, 0) catch return null;
+    return std.mem.trim(u8, buf[0..n], " \t\r\n");
+}
+
+fn machineInfo(log: *Log, gpa: std.mem.Allocator, io: std.Io) !void {
+    const data = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(data);
+    const cpu = readSmall(io, "/proc/cpuinfo", data) orelse "";
+    var model: []const u8 = "unknown";
+    var lines = std.mem.splitScalar(u8, cpu, '\n');
+    while (lines.next()) |line| if (std.mem.startsWith(u8, line, "model name") or std.mem.startsWith(u8, line, "Hardware")) {
+        model = std.mem.trim(u8, line[(std.mem.indexOfScalar(u8, line, ':') orelse 0) + 1 ..], " \t");
+        break;
     };
-    var lines = std.mem.splitScalar(u8, data[0..n], '\n');
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "model name") or std.mem.startsWith(u8, line, "Hardware")) {
-            try log.print("host cpu {s}\n", .{line});
-            return;
+    try log.print("host cpu {s} threads={d}\n", .{ model, std.Thread.getCpuCount() catch 0 });
+    // Power state moves results by 1.5x+ on laptops; record it with every log.
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    var b3: [64]u8 = undefined;
+    var ac: []const u8 = "unknown";
+    for ([_][]const u8{ "/sys/class/power_supply/AC/online", "/sys/class/power_supply/ACAD/online", "/sys/class/power_supply/AC0/online", "/sys/class/power_supply/ADP1/online" }) |path| {
+        if (readSmall(io, path, &b1)) |v| {
+            ac = if (std.mem.eql(u8, v, "1")) "ac" else "battery";
+            break;
         }
     }
-    try log.print("host cpu model unavailable; compare only under similar load/power policy\n", .{});
+    try log.print("power {s} governor={s} profile={s}\n", .{
+        ac,
+        readSmall(io, "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", &b2) orelse "unknown",
+        readSmall(io, "/sys/firmware/acpi/platform_profile", &b3) orelse "unknown",
+    });
 }
 
 const Stamp = struct { iso: [20]u8, file: [18]u8 };
@@ -796,22 +1071,22 @@ fn utcStamp(io: std.Io) !Stamp {
 }
 
 const Git = struct { hash: []u8, status: []const u8 };
-fn gitRev(allocator: std.mem.Allocator, io: std.Io) !Git {
-    const result = std.process.run(allocator, io, .{ .argv = &.{ "git", "rev-parse", "--short=12", "HEAD" }, .stdout_limit = .limited(64), .stderr_limit = .limited(256) }) catch return .{ .hash = try allocator.dupe(u8, "unknown"), .status = "unknown" };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+fn gitRev(gpa: std.mem.Allocator, io: std.Io) !Git {
+    const result = std.process.run(gpa, io, .{ .argv = &.{ "git", "rev-parse", "--short=12", "HEAD" }, .stdout_limit = .limited(64), .stderr_limit = .limited(256) }) catch return .{ .hash = try gpa.dupe(u8, "unknown"), .status = "unknown" };
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
     const success = switch (result.term) {
         .exited => |code| code == 0,
         else => false,
     };
     const text = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (!success or text.len == 0) return .{ .hash = try allocator.dupe(u8, "unknown"), .status = "unknown" };
+    if (!success or text.len == 0) return .{ .hash = try gpa.dupe(u8, "unknown"), .status = "unknown" };
     for (text) |c| if (!std.ascii.isHex(c)) return error.InvalidGitHash;
-    const hash = try allocator.dupe(u8, text);
-    errdefer allocator.free(hash);
-    const status = std.process.run(allocator, io, .{ .argv = &.{ "git", "status", "--porcelain" }, .stdout_limit = .limited(1024 * 1024), .stderr_limit = .limited(256) }) catch return .{ .hash = hash, .status = "unknown" };
-    defer allocator.free(status.stdout);
-    defer allocator.free(status.stderr);
+    const hash = try gpa.dupe(u8, text);
+    errdefer gpa.free(hash);
+    const status = std.process.run(gpa, io, .{ .argv = &.{ "git", "status", "--porcelain" }, .stdout_limit = .limited(1024 * 1024), .stderr_limit = .limited(256) }) catch return .{ .hash = hash, .status = "unknown" };
+    defer gpa.free(status.stdout);
+    defer gpa.free(status.stderr);
     return .{ .hash = hash, .status = switch (status.term) {
         .exited => |code| if (code != 0) "unknown" else if (std.mem.trim(u8, status.stdout, " \t\r\n").len == 0) "clean" else "dirty",
         else => "unknown",
@@ -838,101 +1113,79 @@ fn saveLog(io: std.Io, log: *Log, stamp: [18]u8, hash: []const u8, dirty: bool) 
     std.debug.print("saved {s} and last_bench\n", .{name});
 }
 
+// ---------------------------------------------------------------- tests
+
 test "benchmark UTC filename is 18 bytes, including leap day and midnight" {
     const epoch = try stampForSeconds(0);
     try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", &epoch.iso);
     try std.testing.expectEqualStrings("1970-01-01T000000Z", &epoch.file);
     const leap = try stampForSeconds(1709251199);
-    try std.testing.expectEqualStrings("2024-02-29T23:59:59Z", &leap.iso);
     try std.testing.expectEqualStrings("2024-02-29T235959Z", &leap.file);
     const next = try stampForSeconds(1709251200);
     try std.testing.expectEqualStrings("2024-03-01T000000Z", &next.file);
 }
-test "benchmark options validate and quick defaults respect explicit counts" {
-    const opt = try parseOptions(&.{ "bench", "--iterations=7", "--quick", "--samples", "1", "--warmup=0", "--font=font.ttf" });
-    try std.testing.expectEqual(@as(u32, 7), opt.iterations);
-    try std.testing.expectEqual(@as(u32, 1), opt.samples);
-    try std.testing.expectEqual(@as(u32, 0), opt.warmup);
-    try std.testing.expectEqualStrings("font.ttf", opt.font.?);
-    const quick = try parseOptions(&.{ "bench", "--quick" });
-    try std.testing.expectEqual(@as(u32, 2), quick.iterations);
-    try std.testing.expectEqual(@as(u32, 3), quick.samples);
-    try std.testing.expectError(error.InvalidCount, parseOptions(&.{ "bench", "--samples=0" }));
-    try std.testing.expectError(error.InvalidCount, parseOptions(&.{ "bench", "--iterations=-1" }));
-    try std.testing.expectError(error.InvalidCount, parseOptions(&.{ "bench", "--samples=101" }));
-    try std.testing.expectError(error.UnknownOption, parseOptions(&.{ "bench", "--typo" }));
+
+test "benchmark options validate and quick defaults respect explicit values" {
+    const opt = try parseOptions(&.{ "bench", "--samples=50", "--quick", "--grid", "80x24", "--only=ascii,glyph", "--burst=4" });
+    try std.testing.expectEqual(@as(u32, 50), opt.samples);
+    try std.testing.expectEqual(@as(u32, 1), opt.mib);
+    try std.testing.expectEqual(@as(u16, 80), opt.cols);
+    try std.testing.expectEqual(@as(u16, 24), opt.rows);
+    try std.testing.expectEqual(@as(u32, 4), opt.burst_kib);
+    try std.testing.expect(wanted(opt, "glyph") and !wanted(opt, "sixel"));
+    try std.testing.expectError(error.InvalidCount, parseOptions(&.{ "bench", "--samples=5" }));
+    try std.testing.expectError(error.InvalidCount, parseOptions(&.{ "bench", "--burst=64" }));
+    try std.testing.expectError(error.InvalidGrid, parseOptions(&.{ "bench", "--grid=80" }));
+    try std.testing.expectError(error.UnknownOption, parseOptions(&.{ "bench", "--typo=1" }));
     try std.testing.expectError(error.MissingValue, parseOptions(&.{ "bench", "--font" }));
-    try std.testing.expectError(error.DuplicateOption, parseOptions(&.{ "bench", "--quick", "--quick" }));
     try std.testing.expectError(error.UnexpectedValue, parseOptions(&.{ "bench", "--help=1" }));
 }
-test "benchmark summary uses interpolated median and nearest-rank tail" {
-    var values = [_]f64{ 4, 1, 3, 2 };
-    const s = summarize(&values);
-    try std.testing.expectEqual(@as(f64, 1), s.min);
-    try std.testing.expectEqual(@as(f64, 2.5), s.median);
-    try std.testing.expectEqual(@as(f64, 4), s.p95);
-    try std.testing.expectEqual(@as(f64, 4), s.max);
+
+test "benchmark percentiles are nearest-rank" {
+    var v = [_]u64{ 5, 1, 4, 2, 3, 6, 7, 8, 9, 10 };
+    const p = percentiles(&v);
+    try std.testing.expectEqual(@as(f64, 5), p.p50);
+    try std.testing.expectEqual(@as(f64, 10), p.p95);
+    try std.testing.expectEqual(@as(f64, 5.5), p.mean);
+    var one = [_]u64{7};
+    try std.testing.expectEqual(@as(f64, 7), percentiles(&one).p95);
 }
 
-test "last-24 parser validates scan and selected bytes for ASCII/control/UTF-8" {
-    const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var work = try Work.init(allocator, io, 80, 24, 8, 16, null);
-    defer work.deinit();
-    const corpora = [_][]const u8{
-        "ascii row one\r\nascii row two\r\n",
-        "\x1b[32mgreen\x1b[0m\tcontrol row\r\n",
-        "mixed 汉字 café →\r\nsecond あ row\r\n",
-    };
-    for (corpora) |corpus| {
-        const payload = try makePayload(allocator, corpus);
-        defer allocator.free(payload);
-        work.payload = payload;
-        try work.prepare(.parse_last);
-        work.prepareIteration(.parse_last, 0);
-        try work.perform(.parse_last, 0);
-        try validateParseLast(&work, payload.len);
-    }
-}
-
-test "incremental headless pipeline feeds every byte and matches one-shot VT" {
-    const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var work = try Work.init(allocator, io, 80, 24, 8, 16, null);
-    defer work.deinit();
-    const payload = try makePayload(allocator, "ASCII 汉字 café\x1b[32m green\x1b[0m\r\n");
-    defer allocator.free(payload);
-    work.payload = payload;
-    try work.prepare(.pipeline);
-    // No resets between passes: exercise persistent grids and ring wraparound.
-    try work.perform(.pipeline, 0);
-    try work.perform(.pipeline, 1);
-    try std.testing.expectEqual(payload.len, work.pipeline_fed);
-    try std.testing.expectEqual(work.ring.head, work.ring.tail);
-    try std.testing.expect(work.max_unread <= ring_cap);
-    const incremental_hash = hashTerm(&work.term);
-    var baseline = try VtState.init(allocator, 80, 24, 1000, work.ring.storage);
-    defer baseline.deinit();
-    work.loadPayload();
-    const runs = work.ring.consumeAndGetRuns(std.math.maxInt(usize));
-    baseline.feedRuns(runs);
-    baseline.feedRuns(runs);
-    try std.testing.expectEqual(hashTerm(&baseline), incremental_hash);
-    try std.testing.expectEqualSlices(u32, work.frame.pixels, work.copy_pixels);
-}
-
-test "dirty render scenarios actually damage pixels and skip is clean" {
-    const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var work = try Work.init(allocator, io, 80, 24, 8, 16, null);
-    defer work.deinit();
-    for ([_]Operation{ .skip, .single, .line, .cursor, .selection, .scroll, .full, .resize }) |op| {
-        try work.prepare(op);
-        var i: u32 = 0;
-        while (i < 2) : (i += 1) {
-            work.prepareIteration(op, i);
-            try work.perform(op, i);
-            try std.testing.expectEqual(op != .skip, work.frame.damaged());
+test "benchmark workloads parse completely and images reach the store" {
+    const gpa = std.testing.allocator;
+    for (workloads) |wl| {
+        const bytes = try generate(gpa, wl, 128 * 1024);
+        defer gpa.free(bytes);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0x1b) != null);
+        var ring = try CircBuffer.create(gpa, ring_cap);
+        defer ring.destroy();
+        var term = try VtState.init(gpa, 80, 24, scrollback, ring.storage);
+        defer term.deinit();
+        // Feed in 4093-byte cuts so sequences split across reads, as over a PTY.
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = @min(4093, bytes.len - off);
+            const at: usize = @intCast(ring.head & (ring.capacity - 1));
+            @memcpy(ring.storage[at..][0..n], bytes[off..][0..n]);
+            if (!ring.mapped) mirror(&ring, at, n);
+            ring.head += n;
+            off += n;
+            term.feedRuns(ring.consumeAndGetRuns(std.math.maxInt(usize)));
+        }
+        try std.testing.expectEqual(ring.head, ring.tail);
+        if (std.mem.eql(u8, wl.name, "kitty-image") or std.mem.eql(u8, wl.name, "sixel")) {
+            try std.testing.expect(term.kitty.images.items.len != 0);
         }
     }
+}
+
+test "benchmark PTY pipeline delivers every byte" {
+    const gpa = std.testing.allocator;
+    const bytes = try generate(gpa, workloads[0], 256 * 1024);
+    defer gpa.free(bytes);
+    var env: Env = .{ .gpa = gpa, .io = std.Io.Threaded.global_single_threaded.io(), .opt = .{ .cols = 40, .rows = 10 }, .ctx = null, .cell_w = 8, .cell_h = 16, .emoji = false };
+    var log: Log = .{ .buffer = .init(gpa), .echo = false };
+    defer log.buffer.deinit();
+    try runPipeline(&log, &env, workloads[0], bytes);
+    try std.testing.expect(std.mem.indexOf(u8, log.buffer.writer.buffered(), "pipeline ascii") != null);
 }

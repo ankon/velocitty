@@ -310,6 +310,9 @@ PEAK int        peak_window_pending(PeakWindow *win); /* queued window events; 0
 PEAK uint32_t  *peak_window_backbuffer(PeakWindow *win, size_t *width, size_t *height);
 PEAK void       peak_window_clear(PeakWindow *win, float r, float g, float b, float a);
 PEAK void       peak_window_present(PeakWindow *win);
+/* Present only buffer rows [y, y+h); the rest of the last present is kept.
+   Falls back to a full present when the backend cannot keep it. */
+PEAK void       peak_window_present_rect(PeakWindow *win, uint32_t y, uint32_t h);
 PEAK void       peak_window_set_title(PeakWindow *win, const char *name);
 PEAK void       peak_window_set_class(PeakWindow *win, const char *name); /* WM_CLASS / app_id */
 PEAK void       peak_window_set_opacity(PeakWindow *win, uint8_t alpha); /* 0..255; no-op if the OS has none */

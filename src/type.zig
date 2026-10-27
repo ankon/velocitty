@@ -98,6 +98,11 @@ pub const ascii_lo: u21 = 32;
 pub const ascii_hi: u21 = 126;
 const ascii_n = ascii_hi - ascii_lo + 1;
 
+const Resolved = struct { id: FontId, gid: u16 };
+const memo_n = 4096;
+const MemoEntry = struct { key: u32, id: FontId, gid: u16 };
+const memo_empty: MemoEntry = .{ .key = std.math.maxInt(u32), .id = @enumFromInt(0), .gid = 0 };
+
 pub const Face = struct {
     id: FontId,
     font: TrueType.Font,
@@ -129,6 +134,8 @@ pub const Context = struct {
     replacement: ?Glyph = null,
     ascii_size: u16 = 0,
     stats: GlyphStats = .{},
+    /// Direct-mapped codepoint+style -> resolved face/glyph memo (resolve() is slow for CFF fonts).
+    resolve_memo: [memo_n]MemoEntry = @splat(memo_empty),
 
     pub fn init(allocator: std.mem.Allocator, options: Options) Error!Context {
         assert(options.atlas_width > 0);
@@ -165,6 +172,7 @@ pub const Context = struct {
         self.faces.clearRetainingCapacity();
         self.fallbacks.clearRetainingCapacity();
         self.primary = null;
+        self.clearMemo();
         self.bold = null;
         self.italic = null;
         self.bold_italic = null;
@@ -186,6 +194,7 @@ pub const Context = struct {
             .style = options.style,
         });
         if (self.primary == null) self.primary = id;
+        self.clearMemo();
         if (options.style.bold and options.style.italic) {
             self.bold_italic = id;
         } else if (options.style.bold) {
@@ -199,12 +208,14 @@ pub const Context = struct {
     pub fn select(self: *Context, id: FontId) void {
         assert(@intFromEnum(id) < self.faces.items.len);
         self.primary = id;
+        self.clearMemo();
     }
 
     pub fn setFallbacks(self: *Context, ids: []const FontId) Error!void {
         for (ids) |id| {
             assert(@intFromEnum(id) < self.faces.items.len);
         }
+        self.clearMemo();
         self.fallbacks.clearRetainingCapacity();
         try self.fallbacks.appendSlice(self.allocator, ids);
     }
@@ -229,6 +240,20 @@ pub const Context = struct {
         self.warmAscii() catch {};
     }
 
+    fn clearMemo(self: *Context) void {
+        self.resolve_memo = @splat(memo_empty);
+    }
+
+    fn resolveMemo(self: *Context, codepoint: u21, style: Style) Error!Resolved {
+        const key: u32 = @as(u32, codepoint) | (@as(u32, styleFlags(style)) << 21);
+        const slot = (key *% 0x9E3779B1) >> 20;
+        const e = &self.resolve_memo[slot];
+        if (e.key == key) return .{ .id = e.id, .gid = e.gid };
+        const r = try self.resolve(codepoint, style);
+        e.* = .{ .key = key, .id = r.id, .gid = r.gid };
+        return r;
+    }
+
     fn resetGlyphCaches(self: *Context) void {
         self.atlas.clear();
         self.color_atlas.clear();
@@ -243,12 +268,12 @@ pub const Context = struct {
         return self.faces.items[@intFromEnum(id)].font.metrics(size_px);
     }
 
-    /// Hot-path lookup. No stats, no raster, no LRU move.
-    pub fn peekGlyph(self: *const Context, codepoint: u21, size_px: f32) ?Glyph {
+    /// Hot-path lookup. No stats, no raster; hits refresh LRU.
+    pub fn peekGlyph(self: *Context, codepoint: u21, size_px: f32) ?Glyph {
         return self.peekGlyphStyled(codepoint, size_px, .{});
     }
 
-    pub fn peekGlyphStyled(self: *const Context, codepoint: u21, size_px: f32, style: Style) ?Glyph {
+    pub fn peekGlyphStyled(self: *Context, codepoint: u21, size_px: f32, style: Style) ?Glyph {
         if (size_px <= 0) return null;
         const size_u: u16 = @intFromFloat(@max(1, @round(size_px)));
         if (size_u != self.ascii_size) return null;
@@ -257,14 +282,14 @@ pub const Context = struct {
             return self.ascii[codepoint - ascii_lo];
         }
         if (!styled and codepoint == 0xFFFD) return self.replacement;
-        const resolved = self.resolve(codepoint, style) catch return null;
+        const resolved = self.resolveMemo(codepoint, style) catch return null;
         const key: GlyphKey = .{
             .font_id = @intFromEnum(resolved.id),
             .glyph_id = resolved.gid,
             .size_px = size_u,
             .flags = styleFlags(style),
         };
-        if (self.cache.peek(key)) |g| return g.*;
+        if (self.cache.get(key)) |g| return g.*;
         return null;
     }
 
@@ -309,14 +334,14 @@ pub const Context = struct {
             self.replacement = g;
             return g;
         }
-        const resolved = try self.resolve(codepoint, style);
+        const resolved = try self.resolveMemo(codepoint, style);
         const key: GlyphKey = .{
             .font_id = @intFromEnum(resolved.id),
             .glyph_id = resolved.gid,
             .size_px = size_u,
             .flags = styleFlags(style),
         };
-        if (self.cache.peek(key)) |g| {
+        if (self.cache.get(key)) |g| {
             self.stats.hits += 1;
             return g.*;
         }
@@ -392,7 +417,7 @@ pub const Context = struct {
         return g;
     }
 
-    fn resolve(self: *const Context, codepoint: u21, style: Style) Error!struct { id: FontId, gid: u16 } {
+    fn resolve(self: *const Context, codepoint: u21, style: Style) Error!Resolved {
         const primary = self.primary orelse return error.InvalidFont;
         if (self.options.color_emoji and EastAsian.isEmoji(codepoint)) {
             for (self.fallbacks.items) |id| {

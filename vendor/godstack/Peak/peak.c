@@ -285,6 +285,19 @@ peak_window_present(PeakWindow *win)
 }
 
 void
+peak_window_present_rect(PeakWindow *win, uint32_t y, uint32_t h)
+{
+    if (!win) return;
+#if defined(PEAK_LINUX)
+    peak_platform_window_present_rect(&win->internal, y, h);
+#else
+    (void)y;
+    (void)h;
+    peak_platform_window_present(&win->internal);
+#endif
+}
+
+void
 peak_window_set_title(PeakWindow *win, const char *name)
 {
     if (!win || !name)

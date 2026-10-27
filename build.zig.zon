@@ -1,8 +1,8 @@
 .{
     .name = .Velocitty,
-    .version = "1.0.1",
+    .version = "1.1.0",
     .fingerprint = 0x63301961c26f0d7f, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .sdl3_win32_x64 = .{
             .url = "https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16-win32-x64.zip",

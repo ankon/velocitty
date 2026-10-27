@@ -1,7 +1,0 @@
-run_utc=20261009T081829.507151913Z
-head=6b99d91ca2278736b84ad0a38db0cc50e719e7b7
-head_dirty=true
-spec_sha256=45b8e50ac913e89727d92cc7d3e60d4cd5069f726ac811556111160e4d073eb1
-source_fingerprint=3056a353f72c358b99a6f65d2a806f441e57422dd76e010b0ec56b50a193bdad
-benchmark_mode=default-settings
-command=zig build bench

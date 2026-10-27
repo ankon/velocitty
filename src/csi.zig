@@ -21,7 +21,7 @@ params: []Param = &.{},
 const CharKind = enum(u3) { digit, semi, colon, collect, final, invalid };
 
 const CHAR_MAP: [256]CharKind = initMap: {
-    var map = [_]CharKind{.invalid} ** 256;
+    var map: [256]CharKind = @splat(.invalid);
     for ('0'..'9' + 1) |c| map[c] = .digit;
     map[';'] = .semi;
     map[':'] = .colon;

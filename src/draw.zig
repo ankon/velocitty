@@ -17,6 +17,9 @@ const Clip = struct {
     y1: i32,
 };
 
+/// Per-row paint bookkeeping is stack/inline arrays; taller grids repaint fully.
+const max_rows = 512;
+
 pub const Frame = struct {
     allocator: std.mem.Allocator,
     width: u32,
@@ -34,7 +37,8 @@ pub const Frame = struct {
     last_fill_ns: u64 = 0,
     last_glyph_ns: u64 = 0,
     prev_sel: Select.State = .{},
-    prev_graphics: bool = false,
+    /// Rows that held kitty/sixel pixels last frame; repainted next frame.
+    prev_img_rows: [max_rows]bool = @splat(false),
 
     pub fn init(allocator: std.mem.Allocator, width: u32, height: u32) std.mem.Allocator.Error!Frame {
         assert(width > 0);
@@ -121,14 +125,13 @@ pub const Frame = struct {
         self.dirty_y = 0;
         self.dirty_h = 0;
 
-        const graphics = screen.scrollOffset() == 0 and screen.kitty.placements.items.len != 0;
-        var scroll: i2 = 0;
-        if (have_prev and !graphics and !self.prev_graphics) {
-            if (scrolledBy(screen, self.prev, cols, rows, 1)) {
-                scroll = 1;
-            } else if (scrolledBy(screen, self.prev, cols, rows, -1)) {
-                scroll = -1;
-            }
+        // Images are blitted over text: rows they cover now or covered last
+        // frame are repainted; other rows keep the dirty/compare rules.
+        var img_rows: [max_rows]bool = @splat(false);
+        if (screen.scrollOffset() == 0) imageRows(screen, cell_h, rows, &img_rows);
+        var scroll: i32 = 0;
+        if (have_prev and mayHaveScrolled(screen, rows)) {
+            scroll = scrollDelta(screen, self.prev, cols, rows);
         }
         if (scroll != 0 and self.prev_cursor_on) {
             var pc = self.prev_cursor;
@@ -136,28 +139,28 @@ pub const Frame = struct {
             if (pc.col >= cols) pc.col = cols - 1;
             paintCursor(self, pc.col, pc.row, cell_w, cell_h, self.prev_cursor_style);
         }
-        if (scroll == 1) {
-            shiftPixels(self, cell_h, .up);
-            shiftPrev(self, cols, rows, .up);
-            self.dirty_full = true;
-        } else if (scroll == -1) {
-            shiftPixels(self, cell_h, .down);
-            shiftPrev(self, cols, rows, .down);
+        if (scroll != 0) {
+            const dir: Shift = if (scroll > 0) .up else .down;
+            const n: u16 = @intCast(@abs(scroll));
+            shiftPixels(self, @as(u32, n) * cell_h, dir);
+            shiftPrev(self, cols, rows, n, dir);
+            shiftRows(&self.prev_img_rows, n, dir);
             self.dirty_full = true;
         }
 
         const use_bits = have_prev and screen.scrollOffset() == 0 and scroll == 0;
-        var paint_buf: [512]bool = @splat(false);
+        var paint_buf: [max_rows]bool = @splat(false);
         const overlay_on = Debug.live and screen.debug_overlay.any();
-        const paint_all = rows > paint_buf.len or overlay_on or graphics or self.prev_graphics;
+        const paint_all = rows > max_rows or overlay_on;
         var r: u16 = 0;
         while (r < rows) : (r += 1) {
             const cursor_row = mustPaintCursorRow(r, self.prev_cursor, self.prev_cursor_on, cur, cur_on) or
                 (style_changed and (r == cur.row or r == self.prev_cursor.row)) or
                 (scroll != 0 and cur_on and r == cur.row);
             const sel_row = sel.coversRow(r, cols) or self.prev_sel.coversRow(r, cols);
+            const img_row = r < max_rows and (img_rows[r] or self.prev_img_rows[r]);
             var need = true;
-            if (!paint_all and !cursor_row and !sel_row) {
+            if (!paint_all and !cursor_row and !sel_row and !img_row) {
                 if (use_bits and !screen.lineDirty(r)) {
                     need = false;
                 } else if (have_prev and rowEql(screen.rowCells(r), self.prevRow(r, cols))) {
@@ -239,7 +242,7 @@ pub const Frame = struct {
         self.prev_cursor_on = cur_on;
         self.prev_cursor_style = style;
         self.prev_sel = sel;
-        self.prev_graphics = graphics;
+        self.prev_img_rows = img_rows;
         if (self.dirty_h == self.height) self.dirty_full = true;
     }
 
@@ -338,34 +341,68 @@ fn rowEql(a: []const Term.Cell, b: []const Term.Cell) bool {
     return std.mem.eql(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b));
 }
 
-fn scrolledBy(screen: *const Term.Screen, prev: []const Term.Cell, cols: u16, rows: u16, delta: i2) bool {
-    if (rows < 2 or prev.len != @as(usize, cols) * rows) return false;
-    if (delta == 1) {
-        if (rowEql(screen.rowCells(0), prev[0..cols])) return false;
-        var r: u16 = 0;
-        while (r + 1 < rows) : (r += 1) {
-            const off = @as(usize, r + 1) * cols;
-            if (!rowEql(screen.rowCells(r), prev[off .. off + cols])) return false;
-        }
-        return true;
+/// Scroll search compares rows; skip it unless most lines changed (a scroll
+/// marks every line). History views have no dirty bits, so always search.
+fn mayHaveScrolled(screen: *const Term.Screen, rows: u16) bool {
+    if (screen.scrollOffset() != 0) return true;
+    var dirty: u16 = 0;
+    var r: u16 = 0;
+    while (r < rows) : (r += 1) {
+        if (screen.lineDirty(r)) dirty += 1;
     }
-    if (delta == -1) {
-        const last = @as(usize, rows - 1) * cols;
-        if (rowEql(screen.rowCells(rows - 1), prev[last .. last + cols])) return false;
-        var r: u16 = 1;
-        while (r < rows) : (r += 1) {
-            const off = @as(usize, r - 1) * cols;
-            if (!rowEql(screen.rowCells(r), prev[off .. off + cols])) return false;
+    return dirty * 2 >= rows;
+}
+
+const max_scroll_tries = 4;
+
+/// Rows the content moved since `prev`: positive up (index), negative down.
+/// Any shift is safe (rows that still differ are repainted), so pick the one
+/// that matches the most rows, if it beats not shifting. Only offsets whose
+/// edge row matches are scored, a few per direction, so repeated (blank)
+/// rows stay cheap.
+fn scrollDelta(screen: *const Term.Screen, prev: []const Term.Cell, cols: u16, rows: u16) i32 {
+    if (rows < 2 or prev.len != @as(usize, cols) * rows) return 0;
+    const last = rows - 1;
+    var best: i32 = 0;
+    var best_hits = shiftedHits(screen, prev, cols, rows, 0, .up, 0);
+    for ([_]Shift{ .up, .down }) |dir| {
+        const edge: u16 = if (dir == .up) 0 else last;
+        var tries: u32 = 0;
+        var k: u16 = 1;
+        while (k < rows and tries < max_scroll_tries) : (k += 1) {
+            const p: u16 = if (dir == .up) k else last - k;
+            if (!rowEql(screen.rowCells(edge), prev[@as(usize, p) * cols ..][0..cols])) continue;
+            tries += 1;
+            const hits = shiftedHits(screen, prev, cols, rows, k, dir, best_hits);
+            if (hits > best_hits) {
+                best_hits = hits;
+                best = if (dir == .up) k else -@as(i32, k);
+                // Every overlapping row matches: nothing can do better.
+                if (hits == rows - k) return best;
+            }
         }
-        return true;
     }
-    return false;
+    return best;
+}
+
+/// Rows of `screen` equal to `prev` shifted by `k` in `dir`. Stops early
+/// (returning <= `beat`) once the remaining rows cannot exceed `beat`.
+fn shiftedHits(screen: *const Term.Screen, prev: []const Term.Cell, cols: u16, rows: u16, k: u16, dir: Shift, beat: u32) u32 {
+    var hits: u32 = 0;
+    var r: u16 = 0;
+    while (r + k < rows) : (r += 1) {
+        if (hits + (rows - k - r) <= beat) return hits;
+        const s = if (dir == .up) r else r + k;
+        const p = if (dir == .up) r + k else r;
+        if (rowEql(screen.rowCells(s), prev[@as(usize, p) * cols ..][0..cols])) hits += 1;
+    }
+    return hits;
 }
 
 const Shift = enum { up, down };
 
-fn shiftPixels(self: *Frame, cell_h: u32, dir: Shift) void {
-    const strip = cell_h * self.width;
+fn shiftPixels(self: *Frame, px_rows: u32, dir: Shift) void {
+    const strip = px_rows * self.width;
     if (strip == 0 or self.pixels.len <= strip) return;
     const n = self.pixels.len - strip;
     switch (dir) {
@@ -374,12 +411,13 @@ fn shiftPixels(self: *Frame, cell_h: u32, dir: Shift) void {
     }
 }
 
-fn shiftPrev(self: *Frame, cols: u16, rows: u16, dir: Shift) void {
-    if (rows < 2) return;
-    const n = @as(usize, cols) * (rows - 1);
+fn shiftPrev(self: *Frame, cols: u16, rows: u16, k: u16, dir: Shift) void {
+    if (k >= rows) return;
+    const off = @as(usize, cols) * k;
+    const n = @as(usize, cols) * (rows - k);
     switch (dir) {
-        .up => std.mem.copyForwards(Term.Cell, self.prev[0..n], self.prev[cols .. cols + n]),
-        .down => std.mem.copyBackwards(Term.Cell, self.prev[cols .. cols + n], self.prev[0..n]),
+        .up => std.mem.copyForwards(Term.Cell, self.prev[0..n], self.prev[off .. off + n]),
+        .down => std.mem.copyBackwards(Term.Cell, self.prev[off .. off + n], self.prev[0..n]),
     }
 }
 
@@ -570,6 +608,37 @@ fn drawUnderline(self: *Frame, x0: u32, y0: u32, cell_w: u32, cell_h: u32, color
     }
 }
 
+/// Marks screen rows covered by visible placements (same geometry as blitKitty).
+fn imageRows(screen: *const Term.Screen, cell_h: u32, rows: u16, out: *[max_rows]bool) void {
+    const store = &screen.kitty;
+    for (store.placements.items) |p| {
+        if (p.screen != @as(u1, if (screen.altScreen()) 1 else 0)) continue;
+        const img = store.find(p.image_id) orelse continue;
+        const span: i64 = if (p.rows != 0) p.rows else (img.height + cell_h - 1) / cell_h;
+        const r0: i64 = @max(0, p.row);
+        const r1: i64 = @min(@as(i64, @min(rows, max_rows)), @as(i64, p.row) + span);
+        var r = r0;
+        while (r < r1) : (r += 1) out[@intCast(r)] = true;
+    }
+}
+
+fn shiftRows(flags: *[max_rows]bool, k: u16, dir: Shift) void {
+    if (k >= max_rows) {
+        flags.* = @splat(false);
+        return;
+    }
+    switch (dir) {
+        .up => {
+            std.mem.copyForwards(bool, flags[0 .. max_rows - k], flags[k..]);
+            @memset(flags[max_rows - k ..], false);
+        },
+        .down => {
+            std.mem.copyBackwards(bool, flags[k..], flags[0 .. max_rows - k]);
+            @memset(flags[0..k], false);
+        },
+    }
+}
+
 fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32) void {
     const store = &screen.kitty;
     if (store.placements.items.len == 0) return;
@@ -587,6 +656,36 @@ fn blitKitty(self: *Frame, screen: *const Term.Screen, cell_w: u32, cell_h: u32)
         blitRgba(self, img.rgba, img.width, img.height, src_x, src_y, crop_w, crop_h, dx, dy, dest_w, dest_h);
     }
 }
+
+/// Incremental floor(n * num / den) for n, n+1, ...
+const Step = struct {
+    q: u64,
+    rem: u64,
+    q_step: u64,
+    r_step: u64,
+    den: u64,
+
+    fn init(n: u64, num: u64, den: u64) Step {
+        const total = @as(u128, n) * num;
+        return .{
+            .q = @intCast(total / den),
+            .rem = @intCast(total % den),
+            .q_step = num / den,
+            .r_step = num % den,
+            .den = den,
+        };
+    }
+
+    inline fn next(self: *Step) void {
+        self.q += self.q_step;
+        if (self.rem >= self.den - self.r_step) {
+            self.rem -= self.den - self.r_step;
+            self.q += 1;
+        } else {
+            self.rem += self.r_step;
+        }
+    }
+};
 
 fn blitRgba(
     self: *Frame,
@@ -610,14 +709,20 @@ fn blitRgba(
     const y0: i64 = @max(0, dest_y);
     const x1: i64 = @intCast(@min(@as(i128, self.width), @as(i128, dest_x) + dest_w));
     const y1: i64 = @intCast(@min(@as(i128, self.height), @as(i128, dest_y) + dest_h));
+    if (x0 >= x1 or y0 >= y1) return;
+    // Exact floor(n * src / dest) stepped incrementally (Bresenham): one u128
+    // division per axis per call, then only u64 adds per pixel.
+    const xs = Step.init(@intCast(@as(i128, x0) - dest_x), src_w, dest_w);
+    var ys = Step.init(@intCast(@as(i128, y0) - dest_y), src_h, dest_h);
     var py = y0;
     while (py < y1) : (py += 1) {
-        const y: u64 = @intCast(@as(i128, py) - dest_y);
-        const sy = src_y + @as(u32, @intCast(@as(u128, y) * src_h / dest_h));
+        const sy: u32 = src_y + @as(u32, @intCast(ys.q));
+        ys.next();
+        var xc = xs;
         var px = x0;
         while (px < x1) : (px += 1) {
-            const x: u64 = @intCast(@as(i128, px) - dest_x);
-            const sx = src_x + @as(u32, @intCast(@as(u128, x) * src_w / dest_w));
+            const sx: u32 = src_x + @as(u32, @intCast(xc.q));
+            xc.next();
             const si = (@as(usize, sy) * stride_w + sx) * 4;
             const a = rgba[si + 3];
             if (a == 0) continue;
@@ -1003,4 +1108,55 @@ test "graphics repaint after deletion and clip oversized placement" {
     vt.markDirtyAll();
     frame.render(&vt, 4, 4, null, 8);
     try std.testing.expectEqual(@as(u32, 0xff000000), frame.pixels[0]);
+}
+
+test "incremental render after multi-line scroll and image moves matches full render" {
+    const a = std.testing.allocator;
+    var storage: [4096]u8 = undefined;
+    var vt = try Term.VtState.init(a, 6, 6, 32, &storage);
+    defer vt.deinit();
+    vt.flags.cursor_visible = false;
+    var frame = try Frame.init(a, 24, 24);
+    defer frame.deinit();
+    var fresh = try Frame.init(a, 24, 24);
+    defer fresh.deinit();
+    const line = struct {
+        fn go(t: *Term.VtState, n: u8) void {
+            var c: u8 = 0;
+            while (c < 4) : (c += 1) t.printCodepoint('A' + (n + c) % 26);
+            t.carriageReturn();
+            t.index();
+        }
+    }.go;
+    var n: u8 = 0;
+    // Steps: scroll by k lines; image placed, scrolled with text, deleted.
+    const steps = [_]struct { lines: u8, image: enum { none, place, delete } }{
+        .{ .lines = 8, .image = .none },
+        .{ .lines = 3, .image = .none },
+        .{ .lines = 1, .image = .place },
+        .{ .lines = 2, .image = .none },
+        .{ .lines = 0, .image = .delete },
+        .{ .lines = 4, .image = .none },
+    };
+    for (steps) |step| {
+        for (0..step.lines) |_| {
+            line(&vt, n);
+            n +%= 1;
+        }
+        switch (step.image) {
+            .none => {},
+            .place => _ = vt.kitty.feed("\x1b_Ga=T,f=32,s=1,v=1,i=4,C=1,c=2,r=2;/wAA/w==\x1b\\", .{ .row = 2, .col = 1 }, 6, 6, 0),
+            .delete => _ = vt.kitty.feed("\x1b_Ga=d,d=a,q=2\x1b\\", .{}, 6, 6, 0),
+        }
+        // Shifts that leave most rows matching must be detected.
+        if (step.lines > 0 and step.lines <= 3 and frame.prev.len != 0) {
+            try std.testing.expectEqual(@as(i32, step.lines), scrollDelta(&vt, frame.prev, 6, 6));
+        }
+        frame.render(&vt, 4, 4, null, 8);
+        vt.clearDirty();
+        fresh.invalidate();
+        fresh.forgetPrev();
+        fresh.render(&vt, 4, 4, null, 8);
+        try std.testing.expectEqualSlices(u32, fresh.pixels, frame.pixels);
+    }
 }
