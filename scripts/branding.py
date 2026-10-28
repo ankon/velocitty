@@ -14,7 +14,10 @@ BG = '#0d1117'
 BLOCKS = {'█': (0, 0, 1, 1), '▀': (0, 0, 1, .5), '▄': (0, .5, 1, .5),
           '▌': (0, 0, .5, 1), '▐': (.5, 0, .5, 1), '▂': (0, .75, 1, .25),
           '▁': (0, .875, 1, .125), '▍': (0, 0, .375, 1), '▎': (0, 0, .25, 1),
-          '▏': (0, 0, .125, 1), '_': (0, .95, 1, .05)}
+          '▏': (0, 0, .125, 1), '_': (0, .95, 1, .05),
+          '▘': (0, 0, .5, .5), '▝': (.5, 0, .5, .5), '▖': (0, .5, .5, .5), '▗': (.5, .5, .5, .5)}
+# Multi-rectangle quadrant glyphs, drawn as their single-quadrant parts.
+QUADS = {'▚': '▘▗', '▞': '▝▖', '▛': '▀▖', '▜': '▀▗', '▙': '▄▘', '▟': '▄▝'}
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b[78]')
 
 
@@ -37,9 +40,10 @@ def rectangles(lines, cw, ch, ox, oy, color='#8de3d9'):
                 i = match.end()
                 continue
             char = line[i]
-            if char in BLOCKS:
-                dx, dy, w, h = BLOCKS[char]
-                parts.append(f'<rect x="{ox+(x+dx)*cw:g}" y="{oy+(y+dy)*ch:g}" width="{w*cw:g}" height="{h*ch:g}" fill="{fg}"/>')
+            if char in BLOCKS or char in QUADS:
+                for piece in QUADS.get(char, char):
+                    dx, dy, w, h = BLOCKS[piece]
+                    parts.append(f'<rect x="{ox+(x+dx)*cw:g}" y="{oy+(y+dy)*ch:g}" width="{w*cw:g}" height="{h*ch:g}" fill="{fg}"/>')
             elif char != ' ':
                 raise ValueError(f'unexpected wordmark glyph: {char!r}')
             x += 1
@@ -61,11 +65,11 @@ def render(source, destination, size=None):
 def main():
     art = (ROOT / 'assets/wordmark.txt').read_text().splitlines()
     v = (ROOT / 'assets/icon.txt').read_text().splitlines()
-    icon = rectangles(v, 24, 24, 64, 64, 'url(#ink)')
+    icon = rectangles(v, 16, 16, 0, 0, 'url(#ink)')
     gradient = '''<defs>
       <linearGradient id="plate" x2="0" y2="1"><stop stop-color="#252b34"/><stop offset=".48" stop-color="#141920"/><stop offset="1" stop-color="#0b0e13"/></linearGradient>
       <linearGradient id="rim" x2="0" y2="1"><stop stop-color="#ffffff" stop-opacity=".24"/><stop offset=".4" stop-color="#ffffff" stop-opacity=".05"/><stop offset="1" stop-color="#ffffff" stop-opacity=".09"/></linearGradient>
-      <linearGradient id="ink" x1="0" y1="64" x2="0" y2="448" gradientUnits="userSpaceOnUse"><stop stop-color="#fff0a5"/><stop offset=".35" stop-color="#ffcb59"/><stop offset="1" stop-color="#ff8e00"/></linearGradient>
+      <linearGradient id="ink" x1="0" y1="34" x2="0" y2="482" gradientUnits="userSpaceOnUse"><stop stop-color="#fff0a5"/><stop offset=".35" stop-color="#ffcb59"/><stop offset="1" stop-color="#ff8e00"/></linearGradient>
       <linearGradient id="sheen" x2="0" y2="1"><stop stop-color="#ffffff" stop-opacity=".09"/><stop offset="1" stop-color="#ffffff" stop-opacity="0"/></linearGradient>
       </defs>'''
     plate = '<rect width="512" height="512" rx="112" fill="url(#plate)"/><rect x="1.5" y="1.5" width="509" height="509" rx="110.5" fill="none" stroke="url(#rim)" stroke-width="3"/><path d="M112 3H400A109 109 0 0 1 509 112V190C377 156 135 156 3 190V112A109 109 0 0 1 112 3Z" fill="url(#sheen)"/>'

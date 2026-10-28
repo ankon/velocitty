@@ -6,6 +6,10 @@
 </p>
 
 <p align="center">
+  <img src="icon.png" alt="Velocitty icon" width="128">
+</p>
+
+<p align="center">
     <br />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"></a>
     <a href="https://github.com/valvesky/velocitty"><img src="https://img.shields.io/github/languages/top/valvesky/velocitty?style=flat-square" alt="Language"></a>
