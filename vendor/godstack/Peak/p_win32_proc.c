@@ -21,6 +21,7 @@ typedef void (WINAPI *PeakClosePseudoConsole)(HPCON);
 typedef struct PeakProcRec {
     HANDLE writer, write_event, closer;
     HPCON closing_pc;
+    DWORD quiet_since;
     CRITICAL_SECTION write_lock;
     int write_lock_live, write_closed;
     size_t write_head, write_len;
@@ -639,6 +640,12 @@ peak_fd_read(PEAK_HANDLE fd, void *buf, size_t n)
     if (!got) {
         PeakProcRec *r = peak_internal_proc_find(h);
         if (r && r->proc && WaitForSingleObject(r->proc, 0) == WAIT_OBJECT_0) {
+            /* conhost paints on its own timer, so the child's last output can
+             * still be unrendered when it exits, and 24H2 ClosePseudoConsole
+             * drops it. Close only after the pipe has been quiet for a while. */
+            DWORD now = GetTickCount();
+            if (!r->quiet_since) r->quiet_since = now | 1;
+            if (r->pc && now - r->quiet_since < 250) return -1;
             if (r->pc && !r->closer) {
                 /* ClosePseudoConsole flushes final output and can block on its
                  * pipe. Keep draining on the caller while a worker closes it. */
@@ -654,6 +661,10 @@ peak_fd_read(PEAK_HANDLE fd, void *buf, size_t n)
 		got = (DWORD)n;
 	if (!ReadFile(h, buf, got, &got, NULL))
 		return 0;
+    {
+        PeakProcRec *r = peak_internal_proc_find(h);
+        if (r) r->quiet_since = 0;
+    }
 	return got ? (int)got : 0;
 }
 
