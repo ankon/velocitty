@@ -41,8 +41,8 @@ Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\example.config.toml"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\Velocitty"; Filename: "{app}\velocitty.exe"; WorkingDir: "{userprofile}"
-Name: "{autodesktop}\Velocitty"; Filename: "{app}\velocitty.exe"; WorkingDir: "{userprofile}"; Tasks: desktopicon
+Name: "{autoprograms}\Velocitty"; Filename: "{app}\velocitty.exe"; WorkingDir: "{%USERPROFILE}"
+Name: "{autodesktop}\Velocitty"; Filename: "{app}\velocitty.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\velocitty.exe"; Description: "Launch Velocitty"; Flags: nowait postinstall skipifsilent
