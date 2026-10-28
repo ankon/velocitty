@@ -7,8 +7,11 @@
 - Pipeline: `circbuffer` (line split + runs) → `vt` → `draw`.
 
 # Release
-- `zig build release` builds ReleaseFast for Linux gnu and musl (x86_64 and aarch64). The binary links libc (and libdl/libpthread/libutil on gnu). Peak compiles against host X11 and Wayland headers (`-idirafter /usr/include`) and dlopens Wayland, X11, Pulse, and xkbcommon at runtime.
-- `zig build package` runs `release` and writes `packages/velocitty-<version>-<triple>.tar.gz` (binary, desktop, icon, manpage).
+- `zig build release` builds ReleaseFast for every target whose SDK is available (`-Drelease-os=linux|windows|macos` restricts it). Linux gnu (glibc 2.28 floor) and dynamically linked musl, x86_64 and aarch64, link libc (and libdl/libpthread/libutil on gnu); Peak compiles against host X11 and Wayland headers (`-idirafter /usr/include`) and dlopens Wayland, X11, Pulse, and xkbcommon at runtime. Windows x86_64-gnu cross-builds from Linux (manifest + `velocitty.rc` icon). macOS needs the native SDK or `-Dmacos-sdk=`; Peak is compiled with `.language = .objective_c` (a `-x objective-c` cflag is ignored because Zig puts cflags after the file).
+- `zig build package` runs `scripts/package.py`: Linux `packages/velocitty-<version>-<triple>.tar.gz` (binary, desktop, icon, manpage); Windows portable ZIP plus Inno Setup installer from `scripts/windows.iss` (ZIP only when not on Windows); macOS universal `Velocitty.app` (ad-hoc signed) in a DMG, built on macOS.
+- `.github/workflows/release.yml` builds, tests, packages and smoke-launches on Linux (gnu + Alpine musl under Xvfb), Windows (silent install → `tests/desktop_smoke.py` → uninstall) and macOS (mount DMG, `lipo -verify_arch`, launch) for `main`, `codex/**`, `release/**`, PRs and `v*` tags. `publish` runs only on `release/**` pushes or `v*` tags and uploads the unsigned release plus SHA256SUMS via `scripts/publish_release.py`. Release text is `RELEASE_NOTES.md`.
+- Branding: `scripts/branding.py` regenerates `assets/icon.svg`, `icon.png`, `icon.ico`, `icon.icns` from `assets/icon.txt`, and the README wordmark/GIF via `ttfx` (`--icon-only` skips the wordmark).
+- Windows ConPTY children get `STARTF_USESTDHANDLES` with invalid std handles; otherwise a child of a redirected parent writes to the parent's pipes instead of the pseudoconsole. Windows argv is quoted only when needed (cmd.exe ignores quoted switches like `"/c"`).
 
 # Install
 - `zig build` / `zig build install` is Zig's prefix install (default `zig-out/`: binary, `velocitty.desktop`, icon, manpage).
@@ -60,7 +63,7 @@
 # Rendering tests
 - Config checks: `zig test src/scheme.zig -lc -target x86_64-linux-musl` (integer precision/overflow, ignored TOML values and array tables, escaped strings, actual theme-file font defaults, fallback array order, ownership, overlays, empty reset, malformed input and limits). `src/main.zig` also tests rejection of unrelated fontconfig substitutions and real fallback order/deduplication, primary ASCII and symbol/braille glyphs. The loading smoke test explicitly skips if fontconfig or the two Noto Symbols families are unavailable.
 - Direct current inline check: `zig test src/main.zig src/type/stb_truetype.c src/stb_image.c -Ilib -lc -target x86_64-linux-musl` (106 reported OK with Zig 0.17; overlapping/import-only tests and font early returns are not extra coverage). The musl target avoids host GNU CRT `.sframe` linker incompatibility.
-- Current `build.zig` does not wire `test` or `fuzz-render`; the `tests/` Zig harness imports the removed `ZT` Engine/Runs API. Commands below are historical, not working build targets. Inline `src/` tests and standalone Peak C checks are separate.
+- `zig build test` runs `src/port_test.zig` (inline tests + portable Peak PTY) and `tests/peak_native.c`; `zig build check` compiles them without running; `python3 tests/package_test.py` checks package layouts. `build.zig` does not wire `fuzz-render`; the `tests/` Zig harness imports the removed `ZT` Engine/Runs API. Commands below are historical, not working build targets. Inline `src/` tests and standalone Peak C checks are separate.
 - Cell dumps: `VtState.dumpAlloc` / `dumpCellsAlloc`; fixtures in `tests/vt/*.in` (first line `cols rows`).
 - PNG goldens: `tests/golden/`; mismatch writes `zig-out/screenshots/<name>` and `<name>.diff.png`.
 - Bless dumps and PNGs with `ZT_UPDATE_GOLDEN=1 zig build test`.
