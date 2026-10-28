@@ -179,6 +179,9 @@ static int peak_linux_kind;
 #define PEAK_LINUX_WAYLAND 1
 #define PEAK_LINUX_X11     2
 
+/* X11 and xkbcommon use the same keysym values. */
+static PeakKeyCode peak_internal_x11_key_map(KeySym sym);
+
 #include "p_wayland.c"
 
 static void peak_platform_window_set_title(PeakWindowInternal *intern, const char *name);

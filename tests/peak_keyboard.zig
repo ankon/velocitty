@@ -1,6 +1,14 @@
 const std = @import("std");
 const platform = @import("platform");
 extern fn test_keyboard_setup(win: *anyopaque, scenario: c_int) void;
+extern fn test_keyboard_swapescape() c_int;
+
+test "Wayland special keys and repeat follow caps:swapescape" {
+    const result = test_keyboard_swapescape();
+    if (result == -1) return error.SkipZigTest;
+    if (result != 0) std.debug.print("swapescape check failed at C line {d}\n", .{result});
+    try std.testing.expectEqual(@as(c_int, 0), result);
+}
 
 test "queued text and modified keys reach the platform wrapper once" {
     for (0..7) |scenario| {

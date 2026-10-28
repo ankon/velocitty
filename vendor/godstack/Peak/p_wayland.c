@@ -36,6 +36,7 @@ struct xkb_compose_state;
 	X(xkb_context_unref, void, (struct xkb_context *)) \
 	X(xkb_keymap_new_from_buffer, struct xkb_keymap *, (struct xkb_context *, const char *, size_t, int, int)) \
 	X(xkb_keymap_unref, void, (struct xkb_keymap *)) \
+	X(xkb_keymap_key_repeats, int, (struct xkb_keymap *, uint32_t)) \
 	X(xkb_state_new, struct xkb_state *, (struct xkb_keymap *)) \
 	X(xkb_state_unref, void, (struct xkb_state *)) \
 	X(xkb_state_update_mask, int, (struct xkb_state *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)) \
@@ -1412,7 +1413,12 @@ peak_wayland_key_emit(struct peak_wayland_win *w, uint32_t key, int down, int co
 
 	memset(&ev, 0, sizeof ev);
 	ev.type = down ? PEAK_EVENT_KEY_DOWN : PEAK_EVENT_KEY_UP;
-	ev.key.key = peak_wayland_key_map(key);
+	/* Special keys must follow compositor remaps too (e.g. caps:swapescape).
+	 * Do not fall back for unknown keysyms: Escape may now be Caps_Lock. */
+	if (peak_wayland.xkb_state && peak_xkb.xkb_state_key_get_one_sym)
+		ev.key.key = peak_internal_x11_key_map(peak_xkb.xkb_state_key_get_one_sym(peak_wayland.xkb_state, key + 8));
+	else
+		ev.key.key = peak_wayland_key_map(key);
 	ev.key.mod = peak_wayland.mod;
 	n = 0;
 	ev.key.code = peak_wayland_key_utf8(key, compose && down, buf, sizeof buf, &n);
@@ -1692,7 +1698,10 @@ peak_wayland_keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial, ui
 	} else
 		peak_wayland.mod = peak_wayland_xkb_mod();
 	peak_wayland_key_emit(w, key, state ? 1 : 0, 1);
-	if (peak_wayland_key_mod(key))
+	if (peak_wayland.xkb_keymap && peak_xkb.xkb_keymap_key_repeats) {
+		if (!peak_xkb.xkb_keymap_key_repeats(peak_wayland.xkb_keymap, key + 8))
+			return;
+	} else if (peak_wayland_key_mod(key))
 		return;
 	if (state)
 		peak_wayland_repeat_start(key);

@@ -56,7 +56,7 @@
 - Headless joystick-disabled regression: `cc -Ivendor/godstack/Peak tests/peak_no_gamepad.c -o /tmp/velocitty-peak-no-gamepad -ldl -lpthread -lm && /tmp/velocitty-peak-no-gamepad`.
 - Headless Wayland hit-region, resize/click, extra-button, wheel, and leave tests: `cc -Ivendor/godstack/Peak tests/peak_pointer.c -o /tmp/velocitty-peak-pointer -ldl -lpthread -lm && /tmp/velocitty-peak-pointer`.
 
-- Headless keyboard callback and wrapper regression: `zig test tests/peak_keyboard.c --dep platform -Mroot=tests/peak_keyboard.zig -Mplatform=src/platform/platform.zig -lc -ldl -lpthread -lm`.
+- Headless keyboard callback and wrapper regression: `zig test tests/peak_keyboard.c --dep platform -Mroot=tests/peak_keyboard.zig -Mplatform=src/platform/platform.zig -lc -ldl -lpthread -lm`. Wayland special-key identities use compositor xkb keysyms (not physical evdev codes), and repeat eligibility uses the keymap. Includes a real libxkbcommon `caps:swapescape` regression for press/release, modified Escape, and repeat (skips if libxkbcommon is unavailable).
 - Headless Wayland partial-present regression: `cc -Ivendor/godstack/Peak tests/peak_present.c -o /tmp/velocitty-peak-present -ldl -lpthread -lm && /tmp/velocitty-peak-present`.
 - PTY backpressure and ordering regression: `zig test tests/pty_queue.c --dep platform -Mroot=tests/pty_queue.zig -Mplatform=src/platform/platform.zig -lc -ldl -lpthread -lutil -lm`.
 
