@@ -27,7 +27,10 @@ test "Peak PTY spawns, resizes, drains output and reports child exit" {
     }
     try std.testing.expect(eof);
     const n: usize = @intCast(@min(buffer.head, buffer.capacity));
-    try std.testing.expect(std.mem.indexOf(u8, buffer.storage[0..n], "velocitty-port-ready") != null);
+    if (std.mem.indexOf(u8, buffer.storage[0..n], "velocitty-port-ready") == null) {
+        std.debug.print("PTY output ({d} bytes): {f}\n", .{ n, std.ascii.hexEscape(buffer.storage[0..n], .lower) });
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "Windows PTY input backpressure and close do not block the UI" {
