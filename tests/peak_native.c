@@ -1,5 +1,7 @@
 /* Exercise native Peak behavior without relying on a particular compositor. */
+#ifndef PEAK_NO_GAMEPAD
 #define PEAK_NO_GAMEPAD
+#endif
 #include "../vendor/godstack/Peak/peak.c"
 #include <assert.h>
 
@@ -87,6 +89,10 @@ static void windows_argv_test(void)
     }
     LocalFree(parsed);
     assert(!peak_internal_join_argv(command, 8, argv[0], argv));
+    /* cmd.exe ignores quoted switches, so plain arguments stay bare. */
+    const char *shell[] = {"cmd.exe", "/d", "/c", "echo ready", NULL};
+    assert(peak_internal_join_argv(command, sizeof command, shell[0], shell));
+    assert(strcmp(command, "cmd.exe /d /c \"echo ready\"") == 0);
 }
 #endif
 

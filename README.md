@@ -26,7 +26,7 @@
 
 Velocitty is a lightning-fast terminal for Omarchy, Windows, and macOS.
 
-It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https://github.com/valvesky/velocitty).
+It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https://github.com/valvesky/vt).
 
 ## Features
 - Lightning fast (literally bottlenecked by the kernel)

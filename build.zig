@@ -194,9 +194,11 @@ fn addPeakSource(mod: *std.Build.Module, b: *std.Build, target: std.Build.Resolv
         // Gaming mice can also expose /dev/input/js*: never turn their
         // global joystick events into clicks in every terminal window.
         .flags = if (target.result.os.tag == .macos)
-            &.{ "-x", "objective-c", "-fblocks", "-std=c99", "-Wno-deprecated-declarations", "-DPEAK_NO_GAMEPAD" }
+            &.{ "-fblocks", "-std=c99", "-Wno-deprecated-declarations", "-DPEAK_NO_GAMEPAD" }
         else
             &.{ "-std=c99", "-Wno-deprecated-declarations", "-DPEAK_NO_GAMEPAD" },
+        // Zig places -cflags after the file, so `-x objective-c` would be ignored.
+        .language = if (target.result.os.tag == .macos) .objective_c else null,
     });
     // musl folds dl, pthread, and openpty into libc.
     if (target.result.os.tag == .linux and target.result.abi != .musl and target.result.abi != .none) {

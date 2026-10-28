@@ -179,6 +179,15 @@ peak_internal_quote_arg(char *out, size_t cap, size_t *n, const char *arg)
 {
     if (*n && *n + 1 < cap) out[(*n)++] = ' ';
     if (*n + 1 >= cap) return 0;
+    /* cmd.exe does not recognize quoted switches such as "/c": quote only
+     * arguments that CommandLineToArgvW would otherwise split or alter. */
+    if (*arg && !strpbrk(arg, " \t\n\v\"")) {
+        size_t len = strlen(arg);
+        if (len >= cap - *n) return 0;
+        memcpy(out + *n, arg, len + 1);
+        *n += len;
+        return 1;
+    }
     out[(*n)++] = '"';
     for (;;) {
         size_t slashes = 0;
