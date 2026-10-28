@@ -10,7 +10,9 @@ test {
 
 test "Peak PTY spawns, resizes, drains output and reports child exit" {
     const argv: []const [*:0]const u8 = if (builtin.os.tag == .windows)
-        &.{ "cmd.exe", "/d", "/c", "echo velocitty-port-ready" }
+        // conhost exits with its last client before painting that client's final
+        // output, so keep cmd alive briefly (as in tests/desktop_smoke.py).
+        &.{ "cmd.exe", "/d", "/c", "echo velocitty-port-ready & ping -n 2 127.0.0.1 >nul" }
     else
         &.{ "/bin/sh", "-c", "printf velocitty-port-ready" };
     var pty = try Platform.Pty.open(.{ .cols = 80, .rows = 24 }, .{ .argv = argv });
