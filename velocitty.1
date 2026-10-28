@@ -41,9 +41,9 @@ Window class and title follow
 /
 .B \-\-title
 and may be updated by OSC 176 and OSC 0/2. Geometry, font size, and inner
-padding use CSS 96 DPI times the desktop scale: Hyprland /
-.B GDK_SCALE
-on Linux, per-monitor DPI on Windows, and the Retina backing scale on macOS.
+padding use CSS 96 DPI times the desktop scale: the Hyprland monitor scale
+under Hyprland, the Wayland output scale on other Linux desktops (1 on X11),
+per-monitor DPI on Windows, and the Retina backing scale on macOS.
 Metrics are reapplied on focus and resize when the scale or grid changes.
 .SH PACKAGES
 Linux releases include GNU and dynamically linked musl tarballs for x86_64
@@ -266,7 +266,7 @@ is not given.
 Windows user-config root; USERPROFILE/AppData/Roaming is the fallback.
 .TP
 .B GDK_SCALE ", " QT_SCALE_FACTOR
-Linux UI scale fallback when Hyprland scale is unavailable.
+UI scale under Hyprland when hyprctl reports no monitor scale.
 .TP
 .B TERM ", " COLORTERM ", " TERM_PROGRAM ", " KITTY_WINDOW_ID
 Set in the child. Incoming

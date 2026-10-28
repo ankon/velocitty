@@ -349,20 +349,26 @@ fn gdkScale() f32 {
     return envScale("GDK_SCALE") orelse envScale("QT_SCALE_FACTOR") orelse 1;
 }
 
-fn uiScale(io: std.Io, gpa: std.mem.Allocator) f32 {
-    if (hyprlandFocusedMonitor(io, gpa).scale) |s| return s;
-    return gdkScale();
+/// UI scale source, chosen once at startup by `isHyprland`.
+const ScaleFn = *const fn (io: std.Io, gpa: std.mem.Allocator, window: *Platform.Window, force: bool) f32;
+
+fn isHyprland() bool {
+    return builtin.os.tag == .linux and @import("env.zig").get("HYPRLAND_INSTANCE_SIGNATURE") != null;
 }
 
 var scale_cache: f32 = 0;
 var scale_cache_ms: i64 = 0;
 
-fn uiScaleCached(io: std.Io, gpa: std.mem.Allocator, force: bool) f32 {
+fn hyprlandScale(io: std.Io, gpa: std.mem.Allocator, _: *Platform.Window, force: bool) f32 {
     const now_ms: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .awake).nanoseconds, 1_000_000));
     if (!force and scale_cache != 0 and now_ms -| scale_cache_ms < 500) return scale_cache;
-    scale_cache = uiScale(io, gpa);
+    scale_cache = hyprlandFocusedMonitor(io, gpa).scale orelse gdkScale();
     scale_cache_ms = now_ms;
     return scale_cache;
+}
+
+fn windowScale(_: std.Io, _: std.mem.Allocator, window: *Platform.Window, _: bool) f32 {
+    return window.scale();
 }
 
 fn scaleChanged(a: f32, b: f32) bool {
@@ -514,6 +520,7 @@ fn layoutIfNeeded(
     need_draw: *bool,
     io: std.Io,
     allocator: std.mem.Allocator,
+    ui_scale: ScaleFn,
     config: Scheme.Config,
     scale: *f32,
     size_px: *f32,
@@ -530,7 +537,7 @@ fn layoutIfNeeded(
     rows: *u16,
 ) void {
     if (!need_layout.*) return;
-    const next_scale = if (builtin.os.tag == .linux) uiScaleCached(io, allocator, false) else window.scale();
+    const next_scale = ui_scale(io, allocator, window, false);
     var changed = false;
     if (scaleChanged(next_scale, scale.*)) {
         scale.* = next_scale;
@@ -1105,10 +1112,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     installReloadSignal();
 
     var config = loadConfig(io.io(), allocator);
-    const hypr = hyprlandFocusedMonitor(io.io(), allocator);
+    const hyprland = isHyprland();
+    const ui_scale: ScaleFn = if (hyprland) hyprlandScale else windowScale;
+    const hypr: HyprMonitor = if (hyprland) hyprlandFocusedMonitor(io.io(), allocator) else .{};
     const display_hz: u32 = hypr.hz orelse 60;
     var hz: u32 = display_hz;
-    var scale: f32 = hypr.scale orelse gdkScale();
+    // windowScale needs the window; the first layout pass applies it.
+    var scale: f32 = if (hyprland) hypr.scale orelse gdkScale() else 1;
     scale_cache = scale;
     scale_cache_ms = @intCast(@divTrunc(std.Io.Timestamp.now(io.io(), .awake).nanoseconds, 1_000_000));
     var pad_px: u32 = scalePx(config.pad_px, scale);
@@ -1211,7 +1221,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (reload_requested.swap(false, .acq_rel)) {
             config = loadConfig(io.io(), allocator);
             hz = display_hz;
-            scale = if (builtin.os.tag == .linux) uiScaleCached(io.io(), allocator, true) else window.scale();
+            scale = ui_scale(io.io(), allocator, &window, true);
             size_px = fontPixels(config, scale);
             term.applyScheme(config.scheme);
 
@@ -1247,6 +1257,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             &need_draw,
             io.io(),
             allocator,
+            ui_scale,
             config,
             &scale,
             &size_px,
@@ -1277,6 +1288,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             &need_draw,
             io.io(),
             allocator,
+            ui_scale,
             config,
             &scale,
             &size_px,
