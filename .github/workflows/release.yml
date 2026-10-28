@@ -63,7 +63,23 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Native inline, font, PTY and backpressure tests
-        run: zig build test
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          zig build check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Run the binaries directly so progress is visible and a hang names its test.
+          foreach ($name in 'test.exe', 'peak-native-test.exe') {
+            $exe = Get-ChildItem .zig-cache\o -Recurse -Filter $name | Sort-Object LastWriteTime | Select-Object -Last 1
+            Write-Host "== $($exe.FullName)"
+            $p = Start-Process -FilePath $exe.FullName -NoNewWindow -PassThru
+            if (-not $p.WaitForExit(180000)) {
+              Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'test|cmd|powershell|conhost|OpenConsole' } | Format-Table ProcessId, ParentProcessId, CommandLine -AutoSize | Out-String -Width 400 | Write-Host
+              Stop-Process -Id $p.Id -Force
+              throw "$name timed out"
+            }
+            if ($p.ExitCode -ne 0) { throw "$name failed: $($p.ExitCode)" }
+          }
       - name: Build installer and portable ZIP
         run: zig build package -Drelease-os=windows
       - name: Install, launch and uninstall
@@ -111,7 +127,7 @@ jobs:
           mkdir -p "$mount"
           hdiutil attach packages/*.dmg -mountpoint "$mount" -readonly -nobrowse
           trap 'hdiutil detach "$mount"' EXIT
-          lipo -verify_arch arm64 x86_64 "$mount/Velocitty.app/Contents/MacOS/velocitty"
+          lipo "$mount/Velocitty.app/Contents/MacOS/velocitty" -verify_arch arm64 x86_64
           codesign --verify --strict "$mount/Velocitty.app"
           python3 tests/desktop_smoke.py "$mount/Velocitty.app/Contents/MacOS/velocitty"
       - uses: actions/upload-artifact@v7.0.2
