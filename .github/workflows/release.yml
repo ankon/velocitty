@@ -1,0 +1,137 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main, 'codex/**', 'release/**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.17.0
+      - name: Install Linux build and smoke dependencies
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libwayland-dev fontconfig fonts-dejavu-core fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji xvfb
+      - name: Inline, firehose and portable PTY tests
+        run: zig build test -Dtarget=x86_64-linux-musl
+      - name: Package layout regressions
+        run: python3 tests/package_test.py
+      - name: Build and package four Linux targets
+        run: zig build package -Drelease-os=linux -j2
+      - name: Native GNU window and PTY smoke
+        run: xvfb-run -a python3 tests/desktop_smoke.py zig-out/x86_64-linux-gnu/velocitty
+      - name: Native musl window and PTY smoke on Alpine
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.22 sh -ec '
+            apk add --no-cache python3 libx11 wayland-libs-client libxkbcommon fontconfig font-dejavu xvfb-run
+            xvfb-run -a python3 tests/desktop_smoke.py zig-out/x86_64-linux-musl/velocitty
+          '
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: packages-linux
+          path: packages/*linux*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.17.0
+      - name: Install Inno Setup if needed
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Native inline, font, PTY and backpressure tests
+        run: zig build test
+      - name: Build installer and portable ZIP
+        run: zig build package -Drelease-os=windows
+      - name: Install, launch and uninstall
+        shell: pwsh
+        run: |
+          $installer = (Get-ChildItem packages\*-setup.exe).FullName
+          $install = "$env:RUNNER_TEMP\Velocitty-installed"
+          $p = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/DIR=$install") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Installer failed: $($p.ExitCode)" }
+          python tests/desktop_smoke.py "$install\velocitty.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $p = Start-Process -FilePath "$install\unins000.exe" -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or (Test-Path "$install\velocitty.exe")) { throw "Uninstall failed" }
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: packages-windows
+          path: |
+            packages/*.zip
+            packages/*-setup.exe
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29
+        with:
+          version: 0.17.0
+      - name: Select native SDK
+        run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Native inline, font and portable PTY tests
+        run: zig build test -Dmacos-sdk="$SDKROOT"
+      - name: Build both Mac architectures
+        run: |
+          zig build -Dtarget=aarch64-macos.11.0 -Doptimize=ReleaseFast -Dmacos-sdk="$SDKROOT" -p zig-out/mac-arm64
+          zig build -Dtarget=x86_64-macos.11.0 -Doptimize=ReleaseFast -Dmacos-sdk="$SDKROOT" -p zig-out/mac-x86_64
+      - name: Package universal app and DMG
+        run: |
+          version=$(python3 -c 'import re,pathlib; print(re.search(r"\.version = \"([^\"]+)\"",pathlib.Path("build.zig.zon").read_text())[1])')
+          python3 scripts/package.py "$version" universal-macos zig-out/mac-arm64/bin/velocitty packages --universal zig-out/mac-x86_64/bin/velocitty
+      - name: Mount DMG and launch packaged app
+        run: |
+          mount="$RUNNER_TEMP/Velocitty-mounted"
+          mkdir -p "$mount"
+          hdiutil attach packages/*.dmg -mountpoint "$mount" -readonly -nobrowse
+          trap 'hdiutil detach "$mount"' EXIT
+          lipo -verify_arch arm64 x86_64 "$mount/Velocitty.app/Contents/MacOS/velocitty"
+          codesign --verify --strict "$mount/Velocitty.app"
+          python3 tests/desktop_smoke.py "$mount/Velocitty.app/Contents/MacOS/velocitty"
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: packages-macos
+          path: packages/*.dmg
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/tags/v'))
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Publish complete unsigned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python3 scripts/publish_release.py

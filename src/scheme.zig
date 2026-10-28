@@ -2,8 +2,6 @@
 //!
 //! ```toml
 //! [general]
-//! refreshrate = 30
-//! whitelist = false
 //! pad = 14
 //!
 //! foreground = "#aaaaaa"
@@ -39,14 +37,17 @@
 //! `[colors]`, `[colors.primary]`, `[colors.cursor]`, `[colors.normal]`, and
 //! `[colors.bright]` are accepted, as are `fg` / `bg` and `bright_red`-style
 //! keys. Omarchy `colors.toml` (`muted`, `bright_foreground`, root ANSI) is
-//! accepted. `hz` is an alias for `refreshrate`.
-//! `whitelist` enables ESC parsing during preparse (off by default).
-//! `pad` / `padding` is inner window margin in pixels (default 14).
-//! Unknown keys are ignored.
+//! accepted. `refreshrate` / `hz` and `whitelist` are parsed for compatibility
+//! but are not applied by the runtime. Cadence follows Hyprland, else 60 Hz.
+//! `pad` / `padding` is inner window margin in CSS pixels (default 14).
+//! Supported settings use bare table/key names and single-line strings.
+//! Unknown keys and tables (including array tables) are skipped without
+//! interpreting their values; this is not a full TOML validator.
 //!
 //! `load` overlays user config then the current Omarchy theme so SIGUSR can
 //! re-read colors and font without a restart. Unset family uses fontconfig
-//! `monospace` (`omarchy font current`). Size falls back to Alacritty, then 9.
+//! `monospace` (`omarchy font current`). Size falls back to Alacritty, then
+//! 9 pt if the Omarchy theme's colors.toml exists, otherwise 8 pt.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -68,10 +69,11 @@ pub const FontFamily = struct {
 
 pub const Config = struct {
     scheme: Scheme = .{},
+    /// Legacy setting, parsed but not applied by the runtime.
     hz: u32 = 30,
-    /// Parse whitelisted ESC sequences while splitting lines. Off = NL only.
+    /// Legacy setting, parsed but not applied during line splitting.
     whitelist: bool = false,
-    /// Inner window margin in pixels (all sides).
+    /// Inner window margin in CSS pixels (all sides).
     pad_px: u32 = 14,
     font_family: [max_font_family]u8 = @splat(0),
     font_family_len: u8 = 0,
@@ -129,7 +131,13 @@ fn fillUnsetFont(io: std.Io, gpa: std.mem.Allocator, buf: []u8, cfg: *Config) vo
     var tmp: Config = .{};
     if (xdgConfigPath(buf, "alacritty/alacritty.toml")) |path| overlayFile(io, gpa, path, &tmp);
     if (cfg.font_size == 0 and tmp.font_size != 0) cfg.font_size = tmp.font_size;
-    if (cfg.font_size == 0 and omarchyThemePath(buf, "colors.toml") != null) cfg.font_size = 9;
+    if (cfg.font_size == 0) cfg.font_size = fontSizeFallback(io, omarchyThemePath(buf, "colors.toml"));
+}
+
+fn fontSizeFallback(io: std.Io, theme_colors: ?[]const u8) f32 {
+    const path = theme_colors orelse return 8;
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 8;
+    return if (st.kind == .file) 9 else 8;
 }
 
 /// Fingerprint of config/theme/font files. Changes when Omarchy swaps the theme.
@@ -163,16 +171,13 @@ fn overlayFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8, cfg: *Confi
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return;
     defer gpa.free(bytes);
     cfg.* = parseInto(bytes, cfg.*) catch {
-        std.debug.print("zt: invalid config {s}\n", .{path});
+        std.debug.print("velocitty: invalid config {s}\n", .{path});
         return;
     };
 }
 
 fn envSpan(key: [:0]const u8) ?[]const u8 {
-    if (builtin.os.tag == .windows) return null;
-    if (!builtin.link_libc) return null;
-    const p = std.c.getenv(key) orelse return null;
-    return std.mem.sliceTo(p, 0);
+    return @import("env.zig").get(key);
 }
 
 fn xdgConfigPath(buf: []u8, rel: []const u8) ?[]u8 {
@@ -186,10 +191,21 @@ fn xdgConfigPath(buf: []u8, rel: []const u8) ?[]u8 {
 }
 
 fn userConfigPath(buf: []u8) ?[]u8 {
+    if (envSpan("XDG_CONFIG_HOME")) |xdg| return std.fmt.bufPrint(buf, "{s}/velocitty/config.toml", .{xdg}) catch null;
+    if (builtin.os.tag == .windows) {
+        if (envSpan("APPDATA")) |dir| return std.fmt.bufPrint(buf, "{s}/velocitty/config.toml", .{dir}) catch null;
+        if (envSpan("USERPROFILE")) |dir| return std.fmt.bufPrint(buf, "{s}/AppData/Roaming/velocitty/config.toml", .{dir}) catch null;
+        return null;
+    }
+    if (builtin.os.tag == .macos) {
+        if (envSpan("HOME")) |dir| return std.fmt.bufPrint(buf, "{s}/Library/Application Support/velocitty/config.toml", .{dir}) catch null;
+        return null;
+    }
     return xdgConfigPath(buf, "velocitty/config.toml");
 }
 
 fn omarchyCurrentPath(buf: []u8, name: []const u8) ?[]u8 {
+    if (builtin.os.tag != .linux) return null;
     if (envSpan("XDG_STATE_HOME")) |xdg| {
         return std.fmt.bufPrint(buf, "{s}/omarchy/current/{s}", .{ xdg, name }) catch null;
     }
@@ -200,6 +216,7 @@ fn omarchyCurrentPath(buf: []u8, name: []const u8) ?[]u8 {
 }
 
 fn omarchyThemePath(buf: []u8, name: []const u8) ?[]u8 {
+    if (builtin.os.tag != .linux) return null;
     if (envSpan("XDG_STATE_HOME")) |xdg| {
         return std.fmt.bufPrint(buf, "{s}/omarchy/current/theme/{s}", .{ xdg, name }) catch null;
     }
@@ -223,6 +240,7 @@ const Parser = struct {
     src: []const u8,
     i: usize = 0,
     table: []const u8 = "",
+    string_buf: [512]u8 = undefined,
 
     fn run(self: *Parser, base: Config) error{InvalidToml}!Config {
         var config = base;
@@ -240,22 +258,18 @@ const Parser = struct {
 
     fn parseTable(self: *Parser) error{InvalidToml}!void {
         self.i += 1;
+        const array = self.i < self.src.len and self.src[self.i] == '[';
+        if (array) self.i += 1;
         self.skipSpaces();
-        const start = self.i;
-        while (self.i < self.src.len) {
-            const c = self.src[self.i];
-            if (isBare(c) or c == '.') {
-                self.i += 1;
-                continue;
-            }
-            break;
-        }
-        const name = std.mem.trim(u8, self.src[start..self.i], " \t");
-        self.skipSpaces();
+        const name = try self.parseKey();
         if (self.i >= self.src.len or self.src[self.i] != ']') return error.InvalidToml;
         self.i += 1;
-        if (!validTable(name)) return error.InvalidToml;
-        self.table = name;
+        if (array) {
+            if (self.i >= self.src.len or self.src[self.i] != ']') return error.InvalidToml;
+            self.i += 1;
+        }
+        // Array tables are unrelated settings, even if named [[font]].
+        self.table = if (array) "\x00" else name;
         try self.expectEol();
     }
 
@@ -282,12 +296,12 @@ const Parser = struct {
             config.font_size = size;
         } else if (settings and isFontFamilyKey(key)) {
             const value = try self.parseString();
-            setFamily(config, value);
+            try setFamily(config, value);
         } else if (font_table and std.mem.eql(u8, key, "fallbacks")) {
             try self.parseFontFallbacks(config);
-        } else if (font_table and self.i < self.src.len and self.src[self.i] == '{') {
+        } else if (font_table and std.mem.eql(u8, key, "normal") and self.i < self.src.len and self.src[self.i] == '{') {
             try self.parseFontInline(config);
-        } else if (self.i < self.src.len and (self.src[self.i] == '"' or self.src[self.i] == '\'')) {
+        } else if (isColorKey(self.table, key) and self.i < self.src.len and (self.src[self.i] == '"' or self.src[self.i] == '\'')) {
             const value = try self.parseString();
             if (parseColor(value)) |color| {
                 const table = if (isGeneral(self.table)) "" else self.table;
@@ -301,12 +315,18 @@ const Parser = struct {
 
     fn parseKey(self: *Parser) error{InvalidToml}![]const u8 {
         const start = self.i;
-        _ = try self.parseBare();
-        while (self.i < self.src.len and self.src[self.i] == '.') {
+        while (true) {
+            if (self.i < self.src.len and (self.src[self.i] == '"' or self.src[self.i] == '\'')) {
+                try self.skipString(false);
+            } else {
+                _ = try self.parseBare();
+            }
+            self.skipSpaces();
+            if (self.i >= self.src.len or self.src[self.i] != '.') break;
             self.i += 1;
-            _ = try self.parseBare();
+            self.skipSpaces();
         }
-        return self.src[start..self.i];
+        return std.mem.trim(u8, self.src[start..self.i], " \t");
     }
 
     fn parseFontFallbacks(self: *Parser, config: *Config) error{InvalidToml}!void {
@@ -354,14 +374,13 @@ const Parser = struct {
                 self.i += 1;
                 continue;
             }
-            const key = try self.parseBare();
-            self.skipSpaces();
+            const key = try self.parseKey();
             if (self.i >= self.src.len or self.src[self.i] != '=') return error.InvalidToml;
             self.i += 1;
             self.skipSpaces();
             if (isFontFamilyKey(key) and (self.i < self.src.len and (self.src[self.i] == '"' or self.src[self.i] == '\''))) {
                 const value = try self.parseString();
-                if (config.font_family_len == 0) setFamily(config, value);
+                if (config.font_family_len == 0) try setFamily(config, value);
             } else if (isFontSizeKey(key)) {
                 const size = try self.parseNumber();
                 if (size > 0 and config.font_size == 0) config.font_size = size;
@@ -379,43 +398,119 @@ const Parser = struct {
     }
 
     fn parseString(self: *Parser) error{InvalidToml}![]const u8 {
+        const start = self.i;
+        try self.skipString(false);
+        const raw = self.src[start + 1 .. self.i - 1];
+        if (self.src[start] == '\'' or std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] != '\\') {
+                try self.appendString(&n, raw[i .. i + 1]);
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if (i >= raw.len) return error.InvalidToml;
+            const escaped: u8 = switch (raw[i]) {
+                'b' => 0x08,
+                't' => '\t',
+                'n' => '\n',
+                'f' => 0x0c,
+                'r' => '\r',
+                '"' => '"',
+                '\\' => '\\',
+                'u', 'U' => {
+                    const digits: usize = if (raw[i] == 'u') 4 else 8;
+                    i += 1;
+                    if (raw.len - i < digits) return error.InvalidToml;
+                    var cp: u32 = 0;
+                    for (raw[i..][0..digits]) |c| cp = (cp << 4) | try hexNibble(c);
+                    if (cp > 0x10ffff) return error.InvalidToml;
+                    var utf8: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(@intCast(cp), &utf8) catch return error.InvalidToml;
+                    try self.appendString(&n, utf8[0..len]);
+                    i += digits;
+                    continue;
+                },
+                else => return error.InvalidToml,
+            };
+            try self.appendString(&n, &.{escaped});
+            i += 1;
+        }
+        return self.string_buf[0..n];
+    }
+
+    fn appendString(self: *Parser, n: *usize, bytes: []const u8) error{InvalidToml}!void {
+        if (bytes.len > self.string_buf.len - n.*) return error.InvalidToml;
+        @memcpy(self.string_buf[n.*..][0..bytes.len], bytes);
+        n.* += bytes.len;
+    }
+
+    fn skipString(self: *Parser, allow_multiline: bool) error{InvalidToml}!void {
         if (self.i >= self.src.len) return error.InvalidToml;
         const quote = self.src[self.i];
         if (quote != '"' and quote != '\'') return error.InvalidToml;
         self.i += 1;
-        const start = self.i;
+        const multiline = self.i + 1 < self.src.len and self.src[self.i] == quote and self.src[self.i + 1] == quote;
+        if (multiline) {
+            if (!allow_multiline) return error.InvalidToml;
+            self.i += 2;
+        }
         while (self.i < self.src.len) {
             const c = self.src[self.i];
             if (c == quote) {
-                const s = self.src[start..self.i];
-                self.i += 1;
-                if (std.mem.indexOfScalar(u8, s, '\\') != null) return error.InvalidToml;
-                return s;
+                if (!multiline) {
+                    self.i += 1;
+                    return;
+                }
+                const start = self.i;
+                while (self.i < self.src.len and self.src[self.i] == quote) self.i += 1;
+                if (self.i - start >= 3) return;
+                continue;
             }
-            if (c == '\n' or c == '\r') return error.InvalidToml;
+            if (c == '\\' and quote == '"') {
+                self.i += 1;
+                if (self.i >= self.src.len) return error.InvalidToml;
+                if (!multiline and (self.src[self.i] == '\n' or self.src[self.i] == '\r')) return error.InvalidToml;
+            } else if (!multiline and (c == '\n' or c == '\r')) {
+                return error.InvalidToml;
+            }
             self.i += 1;
         }
         return error.InvalidToml;
     }
 
     fn parseInteger(self: *Parser) error{InvalidToml}!u32 {
-        const n = try self.parseNumber();
-        if (n != @floor(n) or n > @as(f32, @floatFromInt(std.math.maxInt(u32)))) return error.InvalidToml;
-        return @intFromFloat(n);
+        const value = try self.scalar();
+        const digits = if (value[0] == '+') value[1..] else value;
+        if (digits.len == 0) return error.InvalidToml;
+        for (digits, 0..) |c, i| {
+            if (std.ascii.isDigit(c)) continue;
+            if (c != '_' or i == 0 or i + 1 == digits.len or
+                !std.ascii.isDigit(digits[i - 1]) or !std.ascii.isDigit(digits[i + 1])) return error.InvalidToml;
+        }
+        return std.fmt.parseInt(u32, digits, 10) catch return error.InvalidToml;
     }
 
     fn parseNumber(self: *Parser) error{InvalidToml}!f32 {
-        if (self.i >= self.src.len) return error.InvalidToml;
-        if (self.src[self.i] == '+') self.i += 1;
+        const value = try self.scalar();
+        const n = std.fmt.parseFloat(f32, value) catch return error.InvalidToml;
+        if (!std.math.isFinite(n)) return error.InvalidToml;
+        return n;
+    }
+
+    fn scalar(self: *Parser) error{InvalidToml}![]const u8 {
         const start = self.i;
-        if (start >= self.src.len or !std.ascii.isDigit(self.src[start])) return error.InvalidToml;
-        while (self.i < self.src.len and std.ascii.isDigit(self.src[self.i])) self.i += 1;
-        if (self.i < self.src.len and self.src[self.i] == '.') {
-            self.i += 1;
-            if (self.i >= self.src.len or !std.ascii.isDigit(self.src[self.i])) return error.InvalidToml;
-            while (self.i < self.src.len and std.ascii.isDigit(self.src[self.i])) self.i += 1;
+        while (self.i < self.src.len) : (self.i += 1) {
+            switch (self.src[self.i]) {
+                ' ', '\t', '\r', '\n', '#', ',', ']', '}' => break,
+                else => {},
+            }
         }
-        return std.fmt.parseFloat(f32, self.src[start..self.i]) catch return error.InvalidToml;
+        if (self.i == start) return error.InvalidToml;
+        return self.src[start..self.i];
     }
 
     fn parseBool(self: *Parser) error{InvalidToml}!bool {
@@ -429,42 +524,42 @@ const Parser = struct {
         if (self.i >= self.src.len) return error.InvalidToml;
         const c = self.src[self.i];
         if (c == '"' or c == '\'') {
-            _ = try self.parseString();
-            return;
-        }
-        if (c == '+' or std.ascii.isDigit(c)) {
-            _ = try self.parseNumber();
+            try self.skipString(true);
             return;
         }
         if (c == '{' or c == '[') {
             try self.skipBracketed();
             return;
         }
-        if (isBare(c)) {
-            _ = try self.parseBare();
-            return;
+        const start = self.i;
+        while (self.i < self.src.len) : (self.i += 1) {
+            switch (self.src[self.i]) {
+                '\r', '\n', '#', ',', ']', '}' => break,
+                else => {},
+            }
         }
-        return error.InvalidToml;
+        if (std.mem.trim(u8, self.src[start..self.i], " \t").len == 0) return error.InvalidToml;
     }
 
     fn skipBracketed(self: *Parser) error{InvalidToml}!void {
-        const open = self.src[self.i];
-        const close: u8 = if (open == '{') '}' else ']';
+        var closes: [64]u8 = undefined;
+        closes[0] = if (self.src[self.i] == '{') '}' else ']';
         self.i += 1;
-        var depth: u32 = 1;
-        var quote: u8 = 0;
+        var depth: usize = 1;
         while (self.i < self.src.len and depth > 0) {
             const c = self.src[self.i];
-            if (quote != 0) {
-                if (c == quote) quote = 0;
-                self.i += 1;
-                continue;
-            }
             if (c == '"' or c == '\'') {
-                quote = c;
-            } else if (c == open) {
+                try self.skipString(true);
+                continue;
+            } else if (c == '#') {
+                while (self.i < self.src.len and self.src[self.i] != '\n') self.i += 1;
+                continue;
+            } else if (c == '{' or c == '[') {
+                if (depth == closes.len) return error.InvalidToml;
+                closes[depth] = if (c == '{') '}' else ']';
                 depth += 1;
-            } else if (c == close) {
+            } else if (c == '}' or c == ']') {
+                if (c != closes[depth - 1]) return error.InvalidToml;
                 depth -= 1;
             }
             self.i += 1;
@@ -566,26 +661,11 @@ fn isFontSizeKey(key: []const u8) bool {
         std.mem.eql(u8, key, "font-size");
 }
 
-fn setFamily(config: *Config, value: []const u8) void {
+fn setFamily(config: *Config, value: []const u8) error{InvalidToml}!void {
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidToml;
     const n = @min(value.len, max_font_family);
     @memcpy(config.font_family[0..n], value[0..n]);
     config.font_family_len = @intCast(n);
-}
-
-fn validTable(name: []const u8) bool {
-    if (name.len == 0) return false;
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i <= name.len) : (i += 1) {
-        if (i != name.len and name[i] != '.') continue;
-        const part = name[start..i];
-        if (part.len == 0) return false;
-        for (part) |c| {
-            if (!isBare(c)) return false;
-        }
-        start = i + 1;
-    }
-    return true;
 }
 
 fn parseColor(s: []const u8) error{InvalidToml}!Grid.Color {
@@ -639,6 +719,20 @@ fn isMetaTable(table: []const u8) bool {
         std.mem.eql(u8, table, "cursor");
 }
 
+fn isColorKey(table: []const u8, key: []const u8) bool {
+    if (std.mem.eql(u8, table, "normal") or std.mem.eql(u8, table, "colors.normal") or
+        std.mem.eql(u8, table, "bright") or std.mem.eql(u8, table, "colors.bright")) return ansiIndex(key) != null;
+    if (!isGeneral(table) and !isMetaTable(table)) return false;
+    for ([_][]const u8{ "foreground", "fg", "background", "bg", "cursor", "muted", "bright_foreground", "bright-foreground" }) |name| {
+        if (std.mem.eql(u8, key, name)) return true;
+    }
+    if (ansiIndex(key) != null) return true;
+    if (std.mem.startsWith(u8, key, "bright_") or std.mem.startsWith(u8, key, "bright-")) {
+        return ansiIndex(key["bright_".len..]) != null;
+    }
+    return false;
+}
+
 fn apply(scheme: *Scheme, table: []const u8, key: []const u8, color: Grid.Color) void {
     const kind: enum { meta, normal, bright, skip } = blk: {
         if (isMetaTable(table)) break :blk .meta;
@@ -687,6 +781,94 @@ test "empty is default" {
     try std.testing.expectEqual(@as(u32, 30), cfg.hz);
     try std.testing.expectEqual(false, cfg.whitelist);
     try std.testing.expectEqual(@as(u8, 0), cfg.font_family_len);
+}
+
+test "integer settings retain precision and reject overflow" {
+    const cfg = try parse("[general]\npad = 16_777_217\nhz = +4_294_967_295\n");
+    try std.testing.expectEqual(@as(u32, 16_777_217), cfg.pad_px);
+    try std.testing.expectEqual(std.math.maxInt(u32), cfg.hz);
+    for ([_][]const u8{ "4294967296", "4294967295.0", "9999999999999999999999999999999999999999999999999", "-1", "1.5", "1__0", "_10", "10_" }) |value| {
+        for ([_][]const u8{ "pad", "hz" }) |key| {
+            const src = try std.fmt.allocPrint(std.testing.allocator, "[general]\n{s} = {s}\n", .{ key, value });
+            defer std.testing.allocator.free(src);
+            try std.testing.expectError(error.InvalidToml, parse(src));
+        }
+    }
+    try std.testing.expectError(error.InvalidToml, parse("[font]\nsize = 1e1000\n"));
+}
+
+test "unrelated TOML values and array tables preserve supported settings" {
+    const cfg = try parse(
+        \\foreground = "#123456"
+        \\scientific = 1e2
+        \\negative = -1.5
+        \\separated = 1_000
+        \\timestamp = 1979-05-27 07:32:00Z
+        \\escaped = "a \"quote\" and \u0041"
+        \\multiline = """
+        \\not a [table] # still a string
+        \\"""
+        \\items = [
+        \\  # ] } are inside a comment
+        \\  { nested = [1e2, ']', { literal = '''multi
+        \\line ] }''' }] },
+        \\]
+        \\[font]
+        \\unknown = { family = "Wrong Family" }
+        \\size = 1_0.5e0
+        \\[[keyboard.bindings]]
+        \\key = "Return"
+        \\chars = "\u001B[13;2u"
+        \\["unrelated".settings]
+        \\"quoted.key" = "\u0041"
+        \\[general]
+        \\pad = 3
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 0x12), cfg.scheme.fg.r);
+    try std.testing.expectEqual(@as(f32, 10.5), cfg.font_size);
+    try std.testing.expectEqual(@as(u32, 3), cfg.pad_px);
+    try std.testing.expect(cfg.family() == null);
+    const array_cfg = try parse("[[font]]\nsize = 99\nfamily = 'Wrong Family'\n");
+    try std.testing.expectEqual(@as(f32, 0), array_cfg.font_size);
+    try std.testing.expect(array_cfg.family() == null);
+    // A malformed unrelated value must still reject the overlay atomically.
+    try std.testing.expectError(error.InvalidToml, parse("[font]\nsize = 12\nunknown = [1, {a = 2]\n"));
+    try std.testing.expectError(error.InvalidToml, parse("unknown = \"unterminated\n"));
+}
+
+test "font strings decode basic escapes and preserve literal backslashes" {
+    const cfg = try parse(
+        \\[font]
+        \\family = "Example \"Mono\""
+        \\fallbacks = ["Noto Sans Symbols \u0032", "\U0001f600", 'literal\t']
+        \\
+    );
+    try std.testing.expectEqualStrings("Example \"Mono\"", cfg.family().?);
+    const names = cfg.fallbackFamilies();
+    try std.testing.expectEqualStrings("Noto Sans Symbols 2", names[0].slice());
+    try std.testing.expectEqualStrings("😀", names[1].slice());
+    try std.testing.expectEqualStrings("literal\\t", names[2].slice());
+    for ([_][]const u8{ "\\uD800", "\\U00110000", "\\u123", "\\q", "\\u0000" }) |value| {
+        const src = try std.fmt.allocPrint(std.testing.allocator, "[font]\nfamily = \"{s}\"\n", .{value});
+        defer std.testing.allocator.free(src);
+        try std.testing.expectError(error.InvalidToml, parse(src));
+    }
+}
+
+test "font size fallback requires an actual Omarchy theme file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &path_buf);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/colors.toml", .{path_buf[0..dir_len]});
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, null));
+    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, path));
+    try tmp.dir.writeFile(io, .{ .sub_path = "colors.toml", .data = "foreground = '#ffffff'\n" });
+    try std.testing.expectEqual(@as(f32, 9), fontSizeFallback(io, path));
+    try std.testing.expectEqual(@as(f32, 8), fontSizeFallback(io, path_buf[0..dir_len]));
 }
 
 test "alacritty tables" {

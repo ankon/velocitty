@@ -47,6 +47,22 @@ peak_q_pop(PeakQ *q, PeakEvent *ev)
     q->n--;
     return 1;
 }
+static void
+peak_q_text(PeakQ *q, const char *utf8, size_t n)
+{
+    while (n) {
+        PeakEvent ev = {0};
+        size_t chunk = n < sizeof ev.text.bytes ? n : sizeof ev.text.bytes;
+        if (chunk < n) while (chunk && ((unsigned char)utf8[chunk] & 0xc0) == 0x80) chunk--;
+        if (!chunk) return;
+        ev.type = PEAK_EVENT_TEXT;
+        ev.text.n = chunk;
+        memcpy(ev.text.bytes, utf8, chunk);
+        peak_q_push(q, ev);
+        utf8 += chunk; n -= chunk;
+    }
+}
+
 #endif
 
 #define PEAK_CLIP_MAX (1024u * 1024u)
@@ -57,6 +73,7 @@ static struct {
     char *paste;
     size_t paste_n;
     int paste_ready;
+    int synthetic;
     PeakClip paste_which;
 } peak_clip;
 
@@ -227,7 +244,16 @@ peak_window_close(PeakWindow *win)
 int
 peak_window_epoll(PeakWindow *win, PeakEvent *ev)
 {
-    int got = peak_platform_epoll(&win->internal, ev);
+    int got;
+    if (peak_clip.synthetic) {
+        memset(ev, 0, sizeof *ev);
+        peak_clip.synthetic = 0;
+        ev->type = PEAK_EVENT_CLIP;
+        ev->clip.which = peak_clip.paste_which;
+        ev->clip.n = peak_clip.paste_n;
+        return 1;
+    }
+    got = peak_platform_epoll(&win->internal, ev);
     if (got && ev->type == PEAK_EVENT_TEXT)
         peak_text_store(ev->text.bytes, ev->text.n);
     if (got && ev->type == PEAK_EVENT_WINDOW_RESIZE)
@@ -248,7 +274,7 @@ peak_window_pending(PeakWindow *win)
 {
     if (!win)
         return 0;
-    return peak_platform_pending(&win->internal);
+    return peak_clip.synthetic ? 1 : peak_platform_pending(&win->internal);
 }
 
 uint32_t *
@@ -504,8 +530,8 @@ peak_clip_set(PeakWindow *win, PeakClip which, const char *utf8, size_t n)
     if (!peak_clip_own_store(which, utf8, n))
         return 0;
 #if defined(PEAK_WIN32) || defined(PEAK_MACOS) || defined(PEAK_WEB)
-    if (!peak_clip_own_store(which == PEAK_CLIP_PRIMARY ? PEAK_CLIP_CLIPBOARD : PEAK_CLIP_PRIMARY, utf8, n))
-        return 0;
+    /* PRIMARY is terminal-local on platforms with a single system clipboard. */
+    if (which == PEAK_CLIP_PRIMARY) return 1;
 #endif
     if (!win)
         return 1;
@@ -520,10 +546,15 @@ peak_clip_request(PeakWindow *win, PeakClip which)
 
     if (which != PEAK_CLIP_CLIPBOARD && which != PEAK_CLIP_PRIMARY)
         return 0;
-    if (!win) {
+    if (!win
+#if defined(PEAK_WIN32) || defined(PEAK_MACOS)
+        || which == PEAK_CLIP_PRIMARY
+#endif
+    ) {
         if (!peak_clip_own_get(which, &p, &n))
             return 0;
         peak_clip_paste_store(which, p, n);
+        if (win) peak_clip.synthetic = 1;
         return 1;
     }
     return peak_platform_clip_request(&win->internal, which);

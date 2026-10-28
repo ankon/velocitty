@@ -16,7 +16,15 @@ typedef HRESULT (WINAPI *PeakCreatePseudoConsole)(COORD, HANDLE, HANDLE, DWORD, 
 typedef HRESULT (WINAPI *PeakResizePseudoConsole)(HPCON, COORD);
 typedef void (WINAPI *PeakClosePseudoConsole)(HPCON);
 
+#define PEAK_WRITE_CAPACITY 65536
+
 typedef struct PeakProcRec {
+    HANDLE writer, write_event, closer;
+    HPCON closing_pc;
+    CRITICAL_SECTION write_lock;
+    int write_lock_live, write_closed;
+    size_t write_head, write_len;
+    unsigned char write_buf[PEAK_WRITE_CAPACITY];
 	HANDLE read;
 	HANDLE write;
 	HANDLE proc;
@@ -95,13 +103,62 @@ peak_internal_proc_slot(void)
 	return NULL;
 }
 
+static DWORD WINAPI
+peak_internal_close_console(LPVOID userdata)
+{
+    PeakProcRec *r = userdata;
+    peak_close_pc(r->closing_pc);
+    return 0;
+}
+
+static DWORD WINAPI
+peak_internal_writer(LPVOID userdata)
+{
+    PeakProcRec *r = userdata;
+    for (;;) {
+        WaitForSingleObject(r->write_event, INFINITE);
+        for (;;) {
+            DWORD got = 0;
+            size_t n, head;
+            EnterCriticalSection(&r->write_lock);
+            if (r->write_closed) { LeaveCriticalSection(&r->write_lock); return 0; }
+            n = r->write_len;
+            head = r->write_head;
+            if (n > PEAK_WRITE_CAPACITY - head) n = PEAK_WRITE_CAPACITY - head;
+            LeaveCriticalSection(&r->write_lock);
+            if (!n) break;
+            int ok = WriteFile(r->write, r->write_buf + head, (DWORD)n, &got, NULL);
+            EnterCriticalSection(&r->write_lock);
+            if (!ok || !got) r->write_closed = 1;
+            else { r->write_head = (head + got) % PEAK_WRITE_CAPACITY; r->write_len -= got; }
+            int closed = r->write_closed;
+            LeaveCriticalSection(&r->write_lock);
+            if (closed) return 0;
+        }
+    }
+}
+
 static void
 peak_internal_proc_clear(PeakProcRec *r)
 {
-	if (!r)
-		return;
+    if (!r) return;
+    if (r->write_lock_live) {
+        EnterCriticalSection(&r->write_lock);
+        r->write_closed = 1;
+        LeaveCriticalSection(&r->write_lock);
+        if (r->write_event) SetEvent(r->write_event);
+        if (r->writer) {
+            /* Repeat cancellation to cover a worker entering WriteFile just
+             * after the first cancellation, without blocking the UI thread. */
+            while (WaitForSingleObject(r->writer, 10) == WAIT_TIMEOUT) CancelSynchronousIo(r->writer);
+            CloseHandle(r->writer);
+        }
+        if (r->write_event) CloseHandle(r->write_event);
+        DeleteCriticalSection(&r->write_lock);
+    }
 	if (r->write && r->write != r->read && r->write != INVALID_HANDLE_VALUE)
 		CloseHandle(r->write);
+    if (r->closer) { WaitForSingleObject(r->closer, INFINITE); CloseHandle(r->closer); }
 	if (r->pc && peak_close_pc)
 		peak_close_pc(r->pc);
 	if (r->proc)
@@ -118,31 +175,37 @@ peak_internal_io_n(size_t n)
 }
 
 static int
+peak_internal_quote_arg(char *out, size_t cap, size_t *n, const char *arg)
+{
+    if (*n && *n + 1 < cap) out[(*n)++] = ' ';
+    if (*n + 1 >= cap) return 0;
+    out[(*n)++] = '"';
+    for (;;) {
+        size_t slashes = 0;
+        while (*arg == '\\') { slashes++; arg++; }
+        size_t count = (*arg == '"' || !*arg) ? slashes * 2 : slashes;
+        if (*arg == '"') count++;
+        if (count >= cap - *n) return 0;
+        while (count--) out[(*n)++] = '\\';
+        if (!*arg) break;
+        if (*n + 1 >= cap) return 0;
+        out[(*n)++] = *arg++;
+    }
+    if (*n + 1 >= cap) return 0;
+    out[(*n)++] = '"'; out[*n] = 0;
+    return 1;
+}
+
+static int
 peak_internal_join_argv(char *out, size_t cap, const char *file, const char **argv)
 {
-	size_t n;
-	int i;
-
-	if (!out || cap < 2)
-		return 0;
-	out[0] = 0;
-	n = 0;
-	if (file) {
-		n = (size_t)snprintf(out, cap, "\"%s\"", file);
-		if (n >= cap)
-			return 0;
-	}
-	if (!argv)
-		return 1;
-	for (i = file ? 1 : 0; argv[i]; i++) {
-		int w;
-
-		w = snprintf(out + n, cap - n, "%s\"%s\"", n ? " " : "", argv[i]);
-		if (w < 0 || (size_t)w >= cap - n)
-			return 0;
-		n += (size_t)w;
-	}
-	return 1;
+    size_t n = 0;
+    if (!out || cap < 2) return 0;
+    out[0] = 0;
+    if (file && !peak_internal_quote_arg(out, cap, &n, file)) return 0;
+    if (argv) for (int i = file ? 1 : 0; argv[i]; i++)
+        if (!peak_internal_quote_arg(out, cap, &n, argv[i])) return 0;
+    return 1;
 }
 
 static HANDLE
@@ -216,7 +279,7 @@ peak_pty_spawn(const char *file, const char **argv, uint32_t cols, uint32_t rows
 	SIZE_T attr_n;
 	STARTUPINFOEXA si;
 	PROCESS_INFORMATION pi;
-	char cmd[1024];
+	char cmd[32768];
 	SECURITY_ATTRIBUTES sa;
 
 	(void)xpixel;
@@ -265,7 +328,17 @@ peak_pty_spawn(const char *file, const char **argv, uint32_t cols, uint32_t rows
 	rec->write = in_w;
 	rec->proc = pi.hProcess;
 	rec->pc = pc;
-	rec->pid = (int)pi.dwProcessId;
+    rec->pid = (int)pi.dwProcessId;
+    InitializeCriticalSection(&rec->write_lock);
+    rec->write_lock_live = 1;
+    rec->write_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    rec->writer = rec->write_event ? CreateThread(NULL, 0, peak_internal_writer, rec, 0, NULL) : NULL;
+    if (!rec->writer) {
+        TerminateProcess(rec->proc, 1);
+        CloseHandle(rec->read);
+        peak_internal_proc_clear(rec);
+        return p;
+    }
 	p.fd = out_r;
 	p.pid = rec->pid;
 	return p;
@@ -335,8 +408,8 @@ peak_pty_close(PeakProc *pty)
 		return;
 	r = peak_internal_proc_find((HANDLE)pty->fd);
 	if (r) {
-		if (r->proc)
-			WaitForSingleObject(r->proc, INFINITE);
+        if (r->proc && WaitForSingleObject(r->proc, 0) == WAIT_TIMEOUT) TerminateProcess(r->proc, 0);
+        if (r->proc) WaitForSingleObject(r->proc, INFINITE);
 		if (r->read)
 			CloseHandle(r->read);
 		peak_internal_proc_clear(r);
@@ -554,8 +627,20 @@ peak_fd_read(PEAK_HANDLE fd, void *buf, size_t n)
 			return 0;
 		return got ? (int)got : 0;
 	}
-	if (!got)
-		return -1;
+    if (!got) {
+        PeakProcRec *r = peak_internal_proc_find(h);
+        if (r && r->proc && WaitForSingleObject(r->proc, 0) == WAIT_OBJECT_0) {
+            if (r->pc && !r->closer) {
+                /* ClosePseudoConsole flushes final output and can block on its
+                 * pipe. Keep draining on the caller while a worker closes it. */
+                r->closing_pc = r->pc;
+                r->pc = NULL;
+                r->closer = CreateThread(NULL, 0, peak_internal_close_console, r, 0, NULL);
+                if (!r->closer) { r->pc = r->closing_pc; return 0; }
+            } else if (!r->closer) return 0;
+        }
+        return -1;
+    }
 	if (got > n)
 		got = (DWORD)n;
 	if (!ReadFile(h, buf, got, &got, NULL))
@@ -571,6 +656,22 @@ peak_fd_write(PEAK_HANDLE fd, const void *buf, size_t n)
 
 	if (fd == PEAK_HANDLE_INVALID || !buf)
 		return 0;
+    PeakProcRec *r = peak_internal_proc_find((HANDLE)fd);
+    if (r && r->write_lock_live) {
+        size_t tail, first;
+        EnterCriticalSection(&r->write_lock);
+        if (r->write_closed) { LeaveCriticalSection(&r->write_lock); return 0; }
+        if (n > PEAK_WRITE_CAPACITY - r->write_len) n = PEAK_WRITE_CAPACITY - r->write_len;
+        tail = (r->write_head + r->write_len) % PEAK_WRITE_CAPACITY;
+        first = n < PEAK_WRITE_CAPACITY - tail ? n : PEAK_WRITE_CAPACITY - tail;
+        memcpy(r->write_buf + tail, buf, first);
+        memcpy(r->write_buf, (const unsigned char *)buf + first, n - first);
+        r->write_len += n;
+        LeaveCriticalSection(&r->write_lock);
+        if (!n) return -1;
+        SetEvent(r->write_event);
+        return (int)n;
+    }
 	h = peak_internal_write_handle(fd);
 	n = peak_internal_io_n(n);
 	if (!WriteFile(h, buf, (DWORD)n, &got, NULL))

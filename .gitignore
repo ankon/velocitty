@@ -37,3 +37,4 @@ Desktop.ini
 .idea/
 .vscode/
 *.code-workspace
+__pycache__/

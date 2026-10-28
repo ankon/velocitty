@@ -25,23 +25,23 @@
 #define PEAK_WIN32_USER32 "user32.dll"
 #define PEAK_WIN32_GDI32  "gdi32.dll"
 #define PEAK_WIN32_WINMM  "winmm.dll"
-#define PEAK_WIN32_CLASS  "PeakWindow"
+#define PEAK_WIN32_CLASS  L"PeakWindow"
 #define PEAK_WIN32_PROP   "Peak"
 #define PEAK_AUDIO_FRAMES  256
 #define PEAK_AUDIO_BUFFERS 2
 
 #define PEAK_USER32_API(X) \
-        X(RegisterClassExA,   ATOM,    WINAPI, (const WNDCLASSEXA *)) \
-        X(UnregisterClassA,   BOOL,    WINAPI, (LPCSTR, HINSTANCE)) \
-        X(CreateWindowExA,    HWND,    WINAPI, (DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID)) \
+        X(RegisterClassExW,   ATOM,    WINAPI, (const WNDCLASSEXW *)) \
+        X(UnregisterClassW,   BOOL,    WINAPI, (LPCWSTR, HINSTANCE)) \
+        X(CreateWindowExW,    HWND,    WINAPI, (DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID)) \
         X(DestroyWindow,      BOOL,    WINAPI, (HWND)) \
         X(ShowWindow,         BOOL,    WINAPI, (HWND, int)) \
         X(GetDC,              HDC,     WINAPI, (HWND)) \
         X(ReleaseDC,          int,     WINAPI, (HWND, HDC)) \
-        X(PeekMessageA,       BOOL,    WINAPI, (LPMSG, HWND, UINT, UINT, UINT)) \
+        X(PeekMessageW,       BOOL,    WINAPI, (LPMSG, HWND, UINT, UINT, UINT)) \
         X(TranslateMessage,   BOOL,    WINAPI, (const MSG *)) \
-        X(DispatchMessageA,   LRESULT, WINAPI, (const MSG *)) \
-        X(DefWindowProcA,     LRESULT, WINAPI, (HWND, UINT, WPARAM, LPARAM)) \
+        X(DispatchMessageW,   LRESULT, WINAPI, (const MSG *)) \
+        X(DefWindowProcW,     LRESULT, WINAPI, (HWND, UINT, WPARAM, LPARAM)) \
         X(SetPropA,           BOOL,    WINAPI, (HWND, LPCSTR, HANDLE)) \
         X(GetPropA,           HANDLE,  WINAPI, (HWND, LPCSTR)) \
         X(RemovePropA,        HANDLE,  WINAPI, (HWND, LPCSTR)) \
@@ -55,7 +55,7 @@
         X(EmptyClipboard,     BOOL,    WINAPI, (void)) \
         X(SetClipboardData,   HANDLE,  WINAPI, (UINT, HANDLE)) \
         X(GetClipboardData,   HANDLE,  WINAPI, (UINT)) \
-        X(SetWindowTextA,     BOOL,    WINAPI, (HWND, LPCSTR)) \
+        X(SetWindowTextW,     BOOL,    WINAPI, (HWND, LPCWSTR)) \
         X(SetWindowPos,       BOOL,    WINAPI, (HWND, HWND, int, int, int, int, UINT)) \
         X(ShowCursor,         int,     WINAPI, (BOOL)) \
         X(SetCursor,          HCURSOR, WINAPI, (HCURSOR)) \
@@ -128,6 +128,7 @@ typedef struct {
 } PeakWin32;
 
 struct peak_win32_win {
+    WCHAR high_surrogate;
 	HWND hwnd;
 	HDC hdc;
 	uint32_t *buffer;
@@ -305,16 +306,16 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
 	struct peak_win32_win *w;
 	PeakEvent ev;
-	CREATESTRUCTA *cs;
+	CREATESTRUCTW *cs;
 
 	if (msg == WM_NCCREATE) {
-		cs = (CREATESTRUCTA *)lparam;
+		cs = (CREATESTRUCTW *)lparam;
 		peak_user32.SetPropA(hwnd, PEAK_WIN32_PROP, cs->lpCreateParams);
 	}
 
 	w = (struct peak_win32_win *)peak_user32.GetPropA(hwnd, PEAK_WIN32_PROP);
 	if (!w)
-		return peak_user32.DefWindowProcA(hwnd, msg, wparam, lparam);
+		return peak_user32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
 	switch (msg) {
 	case WM_CLOSE:
@@ -348,30 +349,45 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 		ev.type = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) ? PEAK_EVENT_KEY_DOWN : PEAK_EVENT_KEY_UP;
 		ev.key.key = peak_internal_win32_key_map(wparam);
 		ev.key.mod = peak_internal_win32_mod_map();
+        ev.key.code = MapVirtualKeyW((UINT)wparam, MAPVK_VK_TO_CHAR) & 0x7fffffff;
+        if (ev.key.code >= 'A' && ev.key.code <= 'Z' &&
+            !((ev.key.mod & PEAK_KEYMOD_SHIFT) != 0 ^ (ev.key.mod & PEAK_KEYMOD_CAPS) != 0))
+            ev.key.code += 'a' - 'A';
+        /* AltGr is text input, not a Control+Alt shortcut. */
+        if ((peak_user32.GetKeyState(VK_RMENU) & 0x8000) && (ev.key.mod & PEAK_KEYMOD_CTRL))
+            ev.key.mod &= ~(PEAK_KEYMOD_CTRL | PEAK_KEYMOD_ALT);
 		peak_q_push(&w->q, ev);
 		return 0;
-	case WM_CHAR: {
-		char utf8[8];
-		int n;
-
-		n = WideCharToMultiByte(CP_UTF8, 0, (wchar_t *)&wparam, 1, utf8, (int)sizeof utf8, NULL, NULL);
-		if (n > 0 && wparam >= 32) {
-			peak_text_store(utf8, (size_t)n);
-			memset(&ev, 0, sizeof ev);
-			ev.type = PEAK_EVENT_TEXT;
-			ev.text.n = (size_t)n;
-			peak_q_push(&w->q, ev);
-		}
-		return 0;
-	}
+    case WM_CHAR: {
+        WCHAR chars[2];
+        char utf8[8];
+        int count = 1, n;
+        WCHAR ch = (WCHAR)wparam;
+        if (ch >= 0xd800 && ch <= 0xdbff) { w->high_surrogate = ch; return 0; }
+        chars[0] = ch;
+        if (w->high_surrogate && ch >= 0xdc00 && ch <= 0xdfff) {
+            chars[0] = w->high_surrogate; chars[1] = ch; count = 2;
+        }
+        w->high_surrogate = 0;
+        n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, chars, count, utf8, sizeof utf8, NULL, NULL);
+        if (n > 0 && ch >= 32) peak_q_text(&w->q, utf8, (size_t)n);
+        return 0;
+    }
+    case 0x02e0: { /* WM_DPICHANGED */
+        const RECT *r = (const RECT *)lparam;
+        peak_user32.SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
 	case WM_MOUSEWHEEL:
 		memset(&ev, 0, sizeof ev);
 		ev.type = PEAK_EVENT_POINTER;
 		ev.pointer.state = PEAK_POINTER_PRESSED;
 		ev.pointer.type = ((short)HIWORD(wparam) > 0) ? PEAK_POINTER_WHEEL_UP : PEAK_POINTER_WHEEL_DOWN;
-		ev.pointer.x = (float)(short)LOWORD(lparam);
-		ev.pointer.y = (float)(short)HIWORD(lparam);
-		ev.pointer.mod = peak_internal_win32_mod_map();
+		POINT pt = { (short)LOWORD(lparam), (short)HIWORD(lparam) };
+        peak_user32.ScreenToClient(hwnd, &pt);
+        ev.pointer.x = (float)pt.x;
+        ev.pointer.y = (float)pt.y;
+        ev.pointer.mod = peak_internal_win32_mod_map();
 		peak_q_push(&w->q, ev);
 		return 0;
 	case WM_DROPFILES:
@@ -436,11 +452,21 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 			w->last_y = (float)((rc.bottom - rc.top) / 2);
 		}
 		return 0;
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        memset(&ev, 0, sizeof ev);
+        ev.type = PEAK_EVENT_FOCUS;
+        ev.focus.on = msg == WM_SETFOCUS;
+        peak_q_push(&w->q, ev);
+        return 0;
 	case WM_PAINT: {
 		PAINTSTRUCT ps;
 
 		peak_user32.BeginPaint(hwnd, &ps);
-		peak_user32.EndPaint(hwnd, &ps);
+        peak_user32.EndPaint(hwnd, &ps);
+        memset(&ev, 0, sizeof ev);
+        ev.type = PEAK_EVENT_EXPOSE;
+        peak_q_push(&w->q, ev);
 		return 0;
 	}
 	case WM_ERASEBKGND:
@@ -449,16 +475,16 @@ peak_internal_win32_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 		peak_user32.RemovePropA(hwnd, PEAK_WIN32_PROP);
 		return 0;
 	default:
-		return peak_user32.DefWindowProcA(hwnd, msg, wparam, lparam);
+		return peak_user32.DefWindowProcW(hwnd, msg, wparam, lparam);
 	}
 }
 
 static int
 peak_platform_init(void)
 {
-	WNDCLASSEXA wc;
+	WNDCLASSEXW wc;
 
-	if (!peak_user32.CreateWindowExA) {
+	if (!peak_user32.CreateWindowExW) {
 		if (!(peak_win32.user32 = LoadLibraryA(PEAK_WIN32_USER32))) {
 			fputs("Failed to load user32.dll. What system are you fucking using and abusing?", stderr);
 			return 0;
@@ -493,10 +519,12 @@ peak_platform_init(void)
 		wc.cbSize = sizeof wc;
 		wc.style = CS_OWNDC;
 		wc.lpfnWndProc = peak_internal_win32_wndproc;
-		wc.hInstance = GetModuleHandleA(NULL);
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));
+        wc.hIconSm = wc.hIcon;
 		wc.hCursor = peak_user32.LoadCursorA(NULL, IDC_ARROW);
 		wc.lpszClassName = PEAK_WIN32_CLASS;
-		if (!peak_user32.RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+		if (!peak_user32.RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
 			fputs("Failed to register window class", stderr);
 			return 0;
 		}
@@ -510,7 +538,7 @@ peak_platform_quit(void)
 {
 	if (!peak_win32.class_reg)
 		return;
-	peak_user32.UnregisterClassA(PEAK_WIN32_CLASS, GetModuleHandleA(NULL));
+	peak_user32.UnregisterClassW(PEAK_WIN32_CLASS, GetModuleHandleA(NULL));
 	peak_win32.class_reg = 0;
 }
 
@@ -523,7 +551,7 @@ peak_platform_window_open(const char *name, uint32_t width, uint32_t height, uin
 	RECT r;
 	HINSTANCE inst;
 
-	if (!peak_user32.CreateWindowExA && !peak_platform_init())
+	if (!peak_user32.CreateWindowExW && !peak_platform_init())
 		return intern;
 
 	if (!(w = calloc(1, sizeof *w)))
@@ -541,7 +569,9 @@ peak_platform_window_open(const char *name, uint32_t width, uint32_t height, uin
 	r.bottom = (LONG)height;
 	peak_user32.AdjustWindowRectEx(&r, style, FALSE, ex);
 	inst = GetModuleHandleA(NULL);
-	w->hwnd = peak_user32.CreateWindowExA(ex, PEAK_WIN32_CLASS, name, style,
+	WCHAR title[1024];
+    if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, title, 1024)) title[0] = 0;
+    w->hwnd = peak_user32.CreateWindowExW(ex, PEAK_WIN32_CLASS, title, style,
 		CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
 		NULL, NULL, inst, w);
 	if (!w->hwnd) {
@@ -809,9 +839,9 @@ peak_platform_epoll(PeakWindowInternal *intern, PeakEvent *ev)
 	if (!w || !w->hwnd)
 		return 0;
 
-	while (peak_user32.PeekMessageA(&msg, w->hwnd, 0, 0, PM_REMOVE)) {
+	while (peak_user32.PeekMessageW(&msg, w->hwnd, 0, 0, PM_REMOVE)) {
 		peak_user32.TranslateMessage(&msg);
-		peak_user32.DispatchMessageA(&msg);
+		peak_user32.DispatchMessageW(&msg);
 		if (peak_q_pop(&w->q, ev))
 			return 1;
 	}
@@ -836,7 +866,7 @@ peak_platform_pending(PeakWindowInternal *intern)
 		return 0;
 	if (w->q.n)
 		return (int)w->q.n;
-	if (peak_user32.PeekMessageA && peak_user32.PeekMessageA(&msg, w->hwnd, 0, 0, PM_NOREMOVE))
+	if (peak_user32.PeekMessageW && peak_user32.PeekMessageW(&msg, w->hwnd, 0, 0, PM_NOREMOVE))
 		return 1;
 	return 0;
 }
@@ -1063,9 +1093,10 @@ peak_platform_window_set_title(PeakWindowInternal *intern, const char *name)
 	struct peak_win32_win *w;
 
 	w = intern ? intern->w : NULL;
-	if (!w || !w->hwnd || !name || !peak_user32.SetWindowTextA)
+	if (!w || !w->hwnd || !name || !peak_user32.SetWindowTextW)
 		return;
-	peak_user32.SetWindowTextA(w->hwnd, name);
+	WCHAR title[1024];
+    if (MultiByteToWideChar(CP_UTF8, 0, name, -1, title, 1024)) peak_user32.SetWindowTextW(w->hwnd, title);
 }
 
 static void
@@ -1149,8 +1180,11 @@ peak_platform_window_pointer_relative(PeakWindowInternal *intern, int on)
 static float
 peak_platform_window_scale(PeakWindowInternal *intern)
 {
-	(void)intern;
-	return 1.f;
+    struct peak_win32_win *w = intern ? intern->w : NULL;
+    typedef UINT (WINAPI *GetDpiFn)(HWND);
+    GetDpiFn get_dpi = (GetDpiFn)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow");
+    UINT dpi = (w && get_dpi) ? get_dpi(w->hwnd) : 96;
+    return dpi ? (float)dpi / 96.f : 1.f;
 }
 
 #include "p_win32_proc.c"

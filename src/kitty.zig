@@ -241,7 +241,7 @@ pub const Store = struct {
             return self.movedCursor(cmd, cursor, cols, rows);
         }
         // Animation / compose: icat GIFs send a=f / a=a after the first frame.
-        // Do not reply — leftover APC is echoed by the shell as EINVAL:... 
+        // Do not reply — leftover APC is echoed by the shell as EINVAL:...
         if (cmd.action == 'f' or cmd.action == 'a' or cmd.action == 'c') return null;
         if (cmd.action != 't' and cmd.action != 'T' and cmd.action != 0) return null;
         if (cmd.transmission != 'd' and cmd.transmission != 'f' and cmd.transmission != 't') return null;
@@ -634,6 +634,7 @@ fn loadPayload(allocator: std.mem.Allocator, cmd: Command) error{InvalidImage}![
     switch (cmd.transmission) {
         'd' => return decodeB64(allocator, cmd.payload),
         'f', 't' => {
+            if (@import("builtin").os.tag != .linux) return error.InvalidImage;
             const path_raw = decodeB64(allocator, cmd.payload) catch return error.InvalidImage;
             defer allocator.free(path_raw);
             const path = std.mem.trim(u8, path_raw, " \t\r\n");
@@ -672,6 +673,7 @@ fn loadPayload(allocator: std.mem.Allocator, cmd: Command) error{InvalidImage}![
 }
 
 fn payloadPathExists(allocator: std.mem.Allocator, payload: []const u8) bool {
+    if (@import("builtin").os.tag != .linux) return false;
     const path_raw = decodeB64(allocator, payload) catch return false;
     defer allocator.free(path_raw);
     const path = std.mem.trim(u8, path_raw, " \t\r\n");
@@ -891,6 +893,7 @@ test "multipart transfer cap discards through final chunk and recovers" {
 }
 
 test "file transfer rejects FIFO and unsafe temporary deletion" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var ordinary_buf: [128]u8 = undefined;
     var fifo_buf: [128]u8 = undefined;
@@ -952,6 +955,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "temporary transfer honors absolute TMPDIR and anchors its directory" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const old = if (std.c.getenv("TMPDIR")) |p| try allocator.dupeSentinel(u8, std.mem.span(p), 0) else null;
     defer if (old) |value| {

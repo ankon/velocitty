@@ -1,9 +1,10 @@
 //! Calls into the vendored `vendor/godstack/Peak/peak.h` that the terminal uses.
-//! Struct layouts match that header. Linux only.
+//! Struct layouts match that header on Linux, Windows, and macOS.
 
 const std = @import("std");
 
-pub const handle_invalid: i32 = -1;
+pub const Handle = if (@import("builtin").os.tag == .windows) ?*anyopaque else c_int;
+pub const handle_invalid: Handle = if (@import("builtin").os.tag == .windows) @ptrFromInt(std.math.maxInt(usize)) else -1;
 
 /// Bit 0 is shift. Matches `PEAK_KEYMOD_*`.
 pub const KeyMod = packed struct(u32) {
@@ -170,7 +171,7 @@ const ResizeRaw = extern struct {
 
 const PointerRaw = extern struct {
     state: c_int,
-    @"type": c_int,
+    type: c_int,
     x: f32,
     y: f32,
     mod: c_int,
@@ -195,7 +196,7 @@ const FocusRaw = extern struct {
 };
 
 const RawEvent = extern struct {
-    @"type": c_int,
+    type: c_int,
     payload: extern union {
         key: KeyRaw,
         resize: ResizeRaw,
@@ -234,6 +235,10 @@ pub const Window = extern struct {
 
     pub fn fd(self: *Window) i32 {
         return peak_window_fd(self);
+    }
+
+    pub fn scale(self: *Window) f32 {
+        return peak_window_scale(self);
     }
 
     pub fn pending(self: *Window) i32 {
@@ -275,7 +280,7 @@ pub const Window = extern struct {
 };
 
 pub const Proc = extern struct {
-    fd: i32,
+    fd: Handle,
     pid: c_int,
 };
 
@@ -322,23 +327,23 @@ pub fn ptyClose(p: *Proc) void {
     peak_pty_close(p);
 }
 
-pub fn fdRead(fd: i32, buf: []u8) Io {
+pub fn fdRead(fd: Handle, buf: []u8) Io {
     if (buf.len == 0) return .eof;
     return ioFrom(peak_fd_read(fd, buf.ptr, buf.len));
 }
 
-pub fn fdWrite(fd: i32, buf: []const u8) Io {
+pub fn fdWrite(fd: Handle, buf: []const u8) Io {
     if (buf.len == 0) return .{ .n = 0 };
     return ioFrom(peak_fd_write(fd, buf.ptr, buf.len));
 }
 
 pub fn clipSet(win: *Window, which: Clip, utf8: []const u8) bool {
     const p: ?[*]const u8 = if (utf8.len == 0) null else utf8.ptr;
-    return peak_clip_set(win, @intFromEnum(which), p, utf8.len) != 0;
+    return peak_clip_set(win, @backingInt(which), p, utf8.len) != 0;
 }
 
 pub fn clipRequest(win: *Window, which: Clip) bool {
-    return peak_clip_request(win, @intFromEnum(which)) != 0;
+    return peak_clip_request(win, @backingInt(which)) != 0;
 }
 
 pub fn clipTake(win: *Window, dst: []u8) ?usize {
@@ -364,7 +369,7 @@ fn enumFrom(comptime T: type, v: c_int) ?T {
 }
 
 fn eventFrom(raw: RawEvent) Event {
-    const kind = enumFrom(EventType, raw.@"type") orelse return .none;
+    const kind = enumFrom(EventType, raw.type) orelse return .none;
     return switch (kind) {
         .none, .last => .none,
         .key_down, .key_up => blk: {
@@ -382,7 +387,7 @@ fn eventFrom(raw: RawEvent) Event {
         } },
         .pointer => .{ .pointer = .{
             .state = enumFrom(PointerState, raw.payload.pointer.state) orelse .moved,
-            .kind = enumFrom(PointerType, raw.payload.pointer.@"type") orelse .left,
+            .kind = enumFrom(PointerType, raw.payload.pointer.type) orelse .left,
             .x = raw.payload.pointer.x,
             .y = raw.payload.pointer.y,
             .mod = keyModFrom(raw.payload.pointer.mod),
@@ -415,6 +420,7 @@ extern fn peak_window_open(name: [*:0]const u8, width: u32, height: u32, flags: 
 extern fn peak_window_close(window: *Window) void;
 extern fn peak_window_epoll(win: *Window, ev: *RawEvent) c_int;
 extern fn peak_window_fd(win: *Window) c_int;
+extern fn peak_window_scale(win: *Window) f32;
 extern fn peak_window_pending(win: *Window) c_int;
 extern fn peak_window_backbuffer(win: *Window, width: *usize, height: *usize) ?[*]u32;
 extern fn peak_window_present(win: *Window) void;
@@ -428,8 +434,13 @@ extern fn peak_pid() c_int;
 extern fn peak_pty_spawn(file: [*:0]const u8, argv: Argv, cols: u32, rows: u32, xpixel: u32, ypixel: u32) Proc;
 extern fn peak_pty_resize(pty: *Proc, cols: u32, rows: u32, xpixel: u32, ypixel: u32) void;
 extern fn peak_pty_close(pty: *Proc) void;
-extern fn peak_fd_read(fd: i32, buf: *anyopaque, n: usize) c_int;
-extern fn peak_fd_write(fd: i32, buf: *const anyopaque, n: usize) c_int;
+extern fn peak_fd_read(fd: Handle, buf: *anyopaque, n: usize) c_int;
+extern fn peak_fd_write(fd: Handle, buf: *const anyopaque, n: usize) c_int;
+pub extern fn peak_wait(win: ?*Window, fds: [*]const Handle, n: u32, timeout_ms: c_int) c_int;
+pub extern fn peak_env_get(name: [*:0]const u8, buf: [*]u8, cap: usize) c_int;
+pub extern fn peak_env_set(name: [*:0]const u8, value: ?[*:0]const u8) c_int;
+pub extern fn peak_filesystem_cwd(buf: [*]u8, cap: usize) c_int;
+pub extern fn peak_filesystem_chdir(path: [*:0]const u8) c_int;
 extern fn peak_clip_set(win: *Window, which: c_int, utf8: ?[*]const u8, n: usize) c_int;
 extern fn peak_clip_request(win: *Window, which: c_int) c_int;
 extern fn peak_clip_take(win: *Window, dst: ?[*]u8, cap: usize, n: *usize) c_int;

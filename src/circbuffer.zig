@@ -138,9 +138,9 @@ pub const CircBuffer = struct {
     /// it's very particular logic.
     ///
     /// 1. We are allowed to truncate data and to delete old data.
-    /// That's the purpose of a circular buffer in the first place. 
+    /// That's the purpose of a circular buffer in the first place.
     /// Meaning that if we recieve firehose input it will be trucated
-    /// by this function to the size of the circular buffer. 
+    /// by this function to the size of the circular buffer.
     ///
     /// 2. So as to not completely freeze the program, we will
     /// return on EAGAIN IF AND ONLY IF 1/hz has passed. By default
@@ -149,7 +149,7 @@ pub const CircBuffer = struct {
     /// To agents and humans: DO NOT CHANGE THIS COMMENT and do not
     /// break this logic.
     pub const Pump = struct {
-        fd: posix.fd_t,
+        fd: c_int,
         ctx: *anyopaque,
         tick: *const fn (*anyopaque) void,
     };
@@ -161,6 +161,11 @@ pub const CircBuffer = struct {
     /// Same return rules as `readPTY`. `pump` is ticked when its fd wakes during the EAGAIN wait
     /// so window events are not frozen for 1/hz.
     pub fn readPTYPump(self: *CircBuffer, pty: posix.fd_t, hz: u32, pump: ?Pump) error{Hangup}!void {
+        return self.readSource(FdSource{ .fd = pty }, hz, pump);
+    }
+
+    /// A nonblocking source retains the same firehose/EOF/EAGAIN contract on every OS.
+    pub fn readSource(self: *CircBuffer, source: anytype, hz: u32, pump: ?Pump) error{Hangup}!void {
         const rate: u32 = if (hz == 0) 30 else hz;
         const period_ns: i128 = @divTrunc(1_000_000_000, rate);
         const start_ns = nowNs();
@@ -169,7 +174,7 @@ pub const CircBuffer = struct {
         while (true) {
             const off: usize = @intCast(self.head & mask);
             const dest = self.storage[off..][0..self.capacity];
-            const n = posix.read(pty, dest) catch |err| switch (err) {
+            const n = source.read(dest) catch |err| switch (err) {
                 error.WouldBlock => {
                     const elapsed = nowNs() - start_ns;
                     if (elapsed >= period_ns) return;
@@ -178,7 +183,7 @@ pub const CircBuffer = struct {
                     const timeout_ms: i32 = @intCast(@min(@max(@divTrunc(remaining_ns + 999_999, 1_000_000), 1), 1000));
                     if (pump) |p| {
                         const t0 = nowNs();
-                        waitReadable2(pty, p.fd, timeout_ms);
+                        source.wait(p.fd, timeout_ms);
                         p.tick(p.ctx);
                         // Motion/XI floods keep the X fd readable so poll returns
                         // immediately. Sleep on the PTY only for the rest of the
@@ -188,10 +193,10 @@ pub const CircBuffer = struct {
                             if (elapsed2 >= period_ns) return;
                             const rest = period_ns - elapsed2;
                             const rest_ms: i32 = @intCast(@min(@max(@divTrunc(rest + 999_999, 1_000_000), 1), 1000));
-                            waitReadable(pty, rest_ms);
+                            source.wait(null, rest_ms);
                         }
                     } else {
-                        waitReadable(pty, timeout_ms);
+                        source.wait(null, timeout_ms);
                     }
                     continue;
                 },
@@ -564,6 +569,16 @@ fn nowNs() i128 {
     return @intCast(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake).nanoseconds);
 }
 
+const FdSource = struct {
+    fd: posix.fd_t,
+    pub fn read(self: FdSource, dest: []u8) !usize {
+        return posix.read(self.fd, dest);
+    }
+    pub fn wait(self: FdSource, event_fd: ?c_int, timeout_ms: c_int) void {
+        if (event_fd) |fd| waitReadable2(self.fd, fd, timeout_ms) else waitReadable(self.fd, timeout_ms);
+    }
+};
+
 fn waitReadable(fd: posix.fd_t, timeout_ms: i32) void {
     var fds = [_]posix.pollfd{
         .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 },
@@ -611,13 +626,12 @@ test "hardware level mirroring" {
     // |1234xxxx|
 }
 
-
 // NOTE(vasco): The circular buffer must be fed in a very particular way.
 // We must guarrantee that circbuffer.readPTY(); will read until one of two
-// conditions are met: 
+// conditions are met:
 // 1. EOF
 // 2. EAGAIN and 1/hz time has passed since the first read.
-//    Meaning that once we start reading we will be updating the 
+//    Meaning that once we start reading we will be updating the
 //    screen (aka consuming)
 test "correct circular buffer feed" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;

@@ -116,6 +116,7 @@ fn resolveFamilyFile(io: std.Io, gpa: std.mem.Allocator, family: []const u8, exa
 }
 
 fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), config: *const Scheme.Config) !void {
+    if (builtin.os.tag != .linux) return loadNativeFonts(gpa, out, config);
     // Four styled primary faces, emergency primary, custom families, defaults.
     const max_paths = 5 + Scheme.max_font_fallbacks + fallback_paths.len + fallback_families.len;
     var seen: [max_paths][std.fs.max_path_bytes]u8 = undefined;
@@ -215,6 +216,38 @@ fn loadFonts(io: std.Io, gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), 
     if (out.items.len == 0) return error.InvalidFont;
 }
 
+extern fn velocitty_font_load(family: [*:0]const u8, bold: c_int, italic: c_int, exact: c_int, len: *usize) ?[*]u8;
+extern fn velocitty_font_free(data: [*]u8) void;
+
+fn appendNativeFont(gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), name: []const u8, style: @import("type.zig").Style, exact: bool) !void {
+    var name_buf: [256]u8 = undefined;
+    if (name.len >= name_buf.len or std.mem.indexOfScalar(u8, name, 0) != null) return;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+    var n: usize = 0;
+    const data = velocitty_font_load(@ptrCast(&name_buf), @intFromBool(style.bold), @intFromBool(style.italic), @intFromBool(exact), &n) orelse return;
+    defer velocitty_font_free(data);
+    for (out.items) |blob| if (std.mem.eql(u8, blob.bytes, data[0..n])) return;
+    const owned = try gpa.dupe(u8, data[0..n]);
+    errdefer gpa.free(owned);
+    try out.append(gpa, .{ .bytes = owned, .style = style });
+}
+
+fn loadNativeFonts(gpa: std.mem.Allocator, out: *std.ArrayList(FontBlob), config: *const Scheme.Config) !void {
+    const family = config.family() orelse "monospace";
+    try appendNativeFont(gpa, out, family, .{}, false);
+    try appendNativeFont(gpa, out, family, .{ .bold = true }, false);
+    try appendNativeFont(gpa, out, family, .{ .italic = true }, false);
+    try appendNativeFont(gpa, out, family, .{ .bold = true, .italic = true }, false);
+    for (config.fallbackFamilies()) |*name| try appendNativeFont(gpa, out, name.slice(), .{}, true);
+    const defaults = if (builtin.os.tag == .windows)
+        &[_][]const u8{ "Segoe UI Symbol", "Microsoft YaHei", "Segoe UI Emoji" }
+    else
+        &[_][]const u8{ "Apple Symbols", "PingFang SC", "Apple Color Emoji" };
+    for (defaults) |name| try appendNativeFont(gpa, out, name, .{}, true);
+    if (out.items.len == 0) return error.InvalidFont;
+}
+
 fn bindFonts(gpa: std.mem.Allocator, type_ctx: *TypeCtx, blobs: []const FontBlob) !void {
     type_ctx.clearFonts();
     var fallbacks: std.ArrayList(@import("type.zig").FontId) = .empty;
@@ -283,6 +316,7 @@ const HyprMonitor = struct {
 };
 
 fn hyprlandFocusedMonitor(io: std.Io, gpa: std.mem.Allocator) HyprMonitor {
+    if (builtin.os.tag != .linux) return .{};
     const result = std.process.run(gpa, io, .{
         .argv = &.{ "hyprctl", "monitors", "-j" },
         .stdout_limit = .limited(64 * 1024),
@@ -305,8 +339,8 @@ fn hyprlandFocusedMonitor(io: std.Io, gpa: std.mem.Allocator) HyprMonitor {
 }
 
 fn envScale(name: [:0]const u8) ?f32 {
-    const p = std.c.getenv(name) orelse return null;
-    const n = std.fmt.parseFloat(f32, std.mem.sliceTo(p, 0)) catch return null;
+    const p = @import("env.zig").get(name) orelse return null;
+    const n = std.fmt.parseFloat(f32, p) catch return null;
     if (n < 0.25 or n > 8) return null;
     return n;
 }
@@ -459,6 +493,7 @@ fn drainHost(window: *Platform.Window, term: *VtState, allocator: std.mem.Alloca
 }
 
 fn spawnNotify(_: std.mem.Allocator, title: []const u8, body: []const u8) void {
+    if (builtin.os.tag != .linux) return;
     const t = if (title.len == 0) "Velocitty" else title;
     var tbuf: [128]u8 = undefined;
     var bbuf: [512]u8 = undefined;
@@ -495,7 +530,7 @@ fn layoutIfNeeded(
     rows: *u16,
 ) void {
     if (!need_layout.*) return;
-    const next_scale = uiScaleCached(io, allocator, false);
+    const next_scale = if (builtin.os.tag == .linux) uiScaleCached(io, allocator, false) else window.scale();
     var changed = false;
     if (scaleChanged(next_scale, scale.*)) {
         scale.* = next_scale;
@@ -526,7 +561,7 @@ var reload_requested = std.atomic.Value(bool).init(false);
 
 fn installReloadSignal() void {
     switch (builtin.os.tag) {
-        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => {
+        .linux, .macos => {
             const act: std.posix.Sigaction = .{
                 .handler = .{ .handler = struct {
                     fn handle(_: std.posix.SIG) callconv(.c) void {
@@ -1056,7 +1091,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    const cli = parseCli(init.args.vector);
+    var args_arena = std.heap.ArenaAllocator.init(allocator);
+    defer args_arena.deinit();
+    const args = try init.args.toSlice(args_arena.allocator());
+    const argv = try args_arena.allocator().alloc([*:0]const u8, args.len);
+    for (args, 0..) |arg, i| argv[i] = arg.ptr;
+    const cli = parseCli(argv);
 
     // Empty environ makes fc-match ignore Omarchy's fonts.conf (and ~/.local/share/fonts).
     var io = std.Io.Threaded.init(allocator, .{ .environ = init.environ });
@@ -1131,7 +1171,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer pty.close();
 
     const x_fd = window.eventFd();
-    const pty_fd = pty.fd();
 
     var running = true;
     var theme_stamp = Scheme.watchStamp(io.io());
@@ -1172,7 +1211,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (reload_requested.swap(false, .acq_rel)) {
             config = loadConfig(io.io(), allocator);
             hz = display_hz;
-            scale = uiScaleCached(io.io(), allocator, true);
+            scale = if (builtin.os.tag == .linux) uiScaleCached(io.io(), allocator, true) else window.scale();
             size_px = fontPixels(config, scale);
             term.applyScheme(config.scheme);
 
@@ -1225,7 +1264,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         );
 
         var hangup = false;
-        circbuffer.readPTYPump(pty_fd, hz, .{
+        circbuffer.readSource(Platform.PtySource{ .pty = &pty, .window = &window }, hz, .{
             .fd = x_fd,
             .ctx = @ptrCast(&eloop),
             .tick = EventLoop.pump,
@@ -1295,7 +1334,29 @@ test "fontconfig fallbacks require an installed family, not a substitute" {
     try std.testing.expect(fontMatchPath("/fonts/Example.ttf\n", "Example Sans") == null);
 }
 
+test "native fonts load real primary faces and reject unrelated substitutions" {
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+    var blobs: std.ArrayList(FontBlob) = .empty;
+    defer {
+        for (blobs.items) |blob| std.testing.allocator.free(blob.bytes);
+        blobs.deinit(std.testing.allocator);
+    }
+    const config: Scheme.Config = .{};
+    try loadNativeFonts(std.testing.allocator, &blobs, &config);
+    try std.testing.expect(blobs.items.len > 0);
+    var ctx = try TypeCtx.init(std.testing.allocator, .{});
+    defer ctx.deinit();
+    try bindFonts(std.testing.allocator, &ctx, blobs.items);
+    const glyph = try ctx.glyph('A', 16);
+    try std.testing.expect(glyph.advance > 0);
+    var n: usize = 0;
+    const missing = velocitty_font_load("VelocittyMissingFont123", 0, 0, 1, &n);
+    if (missing) |data| velocitty_font_free(data);
+    try std.testing.expect(missing == null);
+}
+
 test "configured font fallbacks load in order and keep the primary font" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = std.testing.environ });
     defer threaded.deinit();

@@ -52,8 +52,9 @@ typedef struct {
 @property(nonatomic, assign) struct peak_macos_win *w;
 @end
 
-@interface PeakMacView : NSView
+@interface PeakMacView : NSView <NSTextInputClient>
 @property(nonatomic, assign) struct peak_macos_win *w;
+@property(nonatomic, retain) NSAttributedString *marked;
 @end
 
 static int peak_internal_macos_buffer(struct peak_macos_win *w, uint32_t width, uint32_t height);
@@ -86,9 +87,25 @@ static void peak_platform_window_pointer_relative(PeakWindowInternal *intern, in
 static float peak_platform_window_scale(PeakWindowInternal *intern);
 
 static NSApplication *peak_macos_app;
+static NSAutoreleasePool *peak_macos_pool;
 static PeakAudio peak_audio;
 
 @implementation PeakMacDelegate
+- (void)windowDidExpose:(NSNotification *)notification
+{
+    (void)notification;
+    if (self.w) { PeakEvent ev = {0}; ev.type = PEAK_EVENT_EXPOSE; peak_q_push(&self.w->q, ev); }
+}
+- (void)windowDidBecomeKey:(NSNotification *)notification
+{
+    (void)notification;
+    if (self.w) { PeakEvent ev = {0}; ev.type = PEAK_EVENT_FOCUS; ev.focus.on = 1; peak_q_push(&self.w->q, ev); }
+}
+- (void)windowDidResignKey:(NSNotification *)notification
+{
+    (void)notification;
+    if (self.w) { PeakEvent ev = {0}; ev.type = PEAK_EVENT_FOCUS; peak_q_push(&self.w->q, ev); }
+}
 - (BOOL)windowShouldClose:(NSWindow *)sender
 {
 	struct peak_macos_win *w;
@@ -108,6 +125,43 @@ static PeakAudio peak_audio;
 @end
 
 @implementation PeakMacView
+- (BOOL)acceptsFirstResponder { return YES; }
+- (void)keyDown:(NSEvent *)event
+{
+    if (!([event modifierFlags] & (NSEventModifierFlagControl | NSEventModifierFlagCommand)))
+        [self interpretKeyEvents:[NSArray arrayWithObject:event]];
+}
+- (void)keyUp:(NSEvent *)event { (void)event; }
+- (void)doCommandBySelector:(SEL)selector { (void)selector; }
+- (void)insertText:(id)value replacementRange:(NSRange)range
+{
+    (void)range;
+    NSString *text = [value isKindOfClass:[NSAttributedString class]] ? [value string] : value;
+    const char *utf8 = [text UTF8String];
+    if (self.w && utf8 && (unsigned char)utf8[0] >= 32) peak_q_text(&self.w->q, utf8, strlen(utf8));
+    self.marked = nil;
+}
+- (void)setMarkedText:(id)value selectedRange:(NSRange)selected replacementRange:(NSRange)replacement
+{
+    (void)selected; (void)replacement;
+    self.marked = [value isKindOfClass:[NSAttributedString class]] ? value : [[[NSAttributedString alloc] initWithString:value] autorelease];
+}
+- (void)unmarkText { self.marked = nil; }
+- (BOOL)hasMarkedText { return [self.marked length] != 0; }
+- (NSRange)markedRange { return [self hasMarkedText] ? NSMakeRange(0, [self.marked length]) : NSMakeRange(NSNotFound, 0); }
+- (NSRange)selectedRange { return NSMakeRange(0, 0); }
+- (NSArray *)validAttributesForMarkedText { return [NSArray array]; }
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range actualRange:(NSRangePointer)actual
+{
+    (void)range; if (actual) *actual = NSMakeRange(NSNotFound, 0); return nil;
+}
+- (NSUInteger)characterIndexForPoint:(NSPoint)point { (void)point; return NSNotFound; }
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actual
+{
+    if (actual) *actual = range;
+    return [[self window] convertRectToScreen:[self convertRect:NSMakeRect(0, 0, 1, 18) toView:nil]];
+}
+- (void)dealloc { self.marked = nil; [super dealloc]; }
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender
 {
 	(void)sender;
@@ -252,8 +306,9 @@ peak_internal_macos_translate(struct peak_macos_win *w, NSEvent *ev)
 	NSPoint pt;
 	const char *utf8;
 
+    if ([ev window] != w->window) return;
 	memset(&out, 0, sizeof out);
-	pt = [ev locationInWindow];
+	pt = [w->view convertPointToBacking:[w->view convertPoint:[ev locationInWindow] fromView:nil]];
 	switch ([ev type]) {
 	case NSEventTypeKeyDown:
 	case NSEventTypeKeyUp:
@@ -263,19 +318,10 @@ peak_internal_macos_translate(struct peak_macos_win *w, NSEvent *ev)
 		utf8 = [[ev characters] UTF8String];
 		out.key.code = (utf8 && utf8[0]) ? (uint32_t)(unsigned char)utf8[0] : 0;
 		peak_q_push(&w->q, out);
-		if ([ev type] == NSEventTypeKeyDown && utf8 && utf8[0] && (unsigned char)utf8[0] >= 32) {
-			PeakEvent tev;
-			size_t n;
 
-			n = strlen(utf8);
-			peak_text_store(utf8, n);
-			memset(&tev, 0, sizeof tev);
-			tev.type = PEAK_EVENT_TEXT;
-			tev.text.n = n;
-			peak_q_push(&w->q, tev);
-		}
 		break;
 	case NSEventTypeScrollWheel:
+        if (pt.x < 0 || pt.y < 0 || pt.x >= w->width || pt.y >= w->height) break;
 		out.type = PEAK_EVENT_POINTER;
 		out.pointer.state = PEAK_POINTER_PRESSED;
 		out.pointer.type = ([ev deltaY] < 0) ? PEAK_POINTER_WHEEL_DOWN : PEAK_POINTER_WHEEL_UP;
@@ -293,6 +339,7 @@ peak_internal_macos_translate(struct peak_macos_win *w, NSEvent *ev)
 	case NSEventTypeMouseMoved:
 	case NSEventTypeLeftMouseDragged:
 	case NSEventTypeRightMouseDragged:
+        if (pt.x < 0 || pt.y < 0 || pt.x >= w->width || pt.y >= w->height) break;
 		out.type = PEAK_EVENT_POINTER;
 		out.pointer.x = (float)pt.x;
 		out.pointer.y = (float)((double)w->height - pt.y);
@@ -329,6 +376,7 @@ peak_internal_macos_translate(struct peak_macos_win *w, NSEvent *ev)
 static void
 peak_internal_macos_pump(struct peak_macos_win *w)
 {
+    @autoreleasepool {
 	NSEvent *ev;
 	NSRect bounds;
 	CGFloat scale;
@@ -343,8 +391,15 @@ peak_internal_macos_pump(struct peak_macos_win *w)
 			dequeue:YES];
 		if (!ev)
 			break;
-		peak_internal_macos_translate(w, ev);
-	}
+        if ([ev type] == NSEventTypeKeyDown && ([ev modifierFlags] & NSEventModifierFlagCommand)
+            && ([ev keyCode] == 0x0c || [ev keyCode] == 0x0d)) {
+            PeakEvent close = {0}; close.type = PEAK_EVENT_WINDOW_CLOSE; peak_q_push(&w->q, close);
+            continue;
+        }
+        peak_internal_macos_translate(w, ev);
+        [peak_macos_app sendEvent:ev];
+    }
+    [peak_macos_app updateWindows];
 	bounds = [w->view bounds];
 	scale = [w->window backingScaleFactor];
 	if (scale < 1.0)
@@ -365,11 +420,14 @@ peak_internal_macos_pump(struct peak_macos_win *w)
 	}
 }
 
+    }
+
 static int
 peak_platform_init(void)
 {
 	if (peak_macos_app)
 		return 1;
+    if (!peak_macos_pool) peak_macos_pool = [NSAutoreleasePool new];
 	peak_macos_app = [NSApplication sharedApplication];
 	if (!peak_macos_app) {
 		fputs("Failed to get NSApplication. What system are you fucking using and abusing?", stderr);
@@ -383,7 +441,9 @@ peak_platform_init(void)
 static void
 peak_platform_quit(void)
 {
-	peak_macos_app = nil;
+    peak_macos_app = nil;
+    [peak_macos_pool drain];
+    peak_macos_pool = nil;
 }
 
 static PeakWindowInternal
@@ -415,6 +475,7 @@ peak_platform_window_open(const char *name, uint32_t width, uint32_t height, uin
 		free(w);
 		return intern;
 	}
+    [w->window setReleasedWhenClosed:NO];
 	[w->window setTitle:[NSString stringWithUTF8String:name]];
 	w->flags = (int)flags;
 	w->cursor_on = 1;
@@ -433,6 +494,7 @@ peak_platform_window_open(const char *name, uint32_t width, uint32_t height, uin
 		view.w = w;
 		[w->window setContentView:view];
 		w->view = view;
+        [view release];
 	}
 	w->layer = [CAMetalLayer new];
 	[w->view setLayer:w->layer];
@@ -444,6 +506,7 @@ peak_platform_window_open(const char *name, uint32_t width, uint32_t height, uin
 	del.w = w;
 	w->delegate = del;
 	[w->window setDelegate:del];
+    [w->window makeFirstResponder:w->view];
 	[w->window makeKeyAndOrderFront:nil];
 	[peak_macos_app activateIgnoringOtherApps:YES];
 	intern.w = w;

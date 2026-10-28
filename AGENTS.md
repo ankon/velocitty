@@ -2,8 +2,8 @@
 - DESIGN.md is the original design sketch, not a feature-completeness contract.
 - Do not change the README.md
 - Keep AGENTS.md up-to-date.
-- Linux-only, Omarchy-first terminal. Executable is `src/main.zig`.
-- Do not add Windows, macOS, or other-OS paths. Target Linux via Peak (Wayland, then X11). Omarchy (Hyprland, themes, fonts, app menu) is the primary desktop.
+- Omarchy-first terminal, with Windows and macOS ports through Peak. Executable is `src/main.zig`.
+- Use Peak for windowing, input, clipboard, PTYs and process I/O on Linux (Wayland, then X11), Windows (Win32/ConPTY), and macOS (AppKit/POSIX PTY). Omarchy (Hyprland, themes, fonts, app menu) remains the primary Linux desktop.
 - Pipeline: `circbuffer` (line split + runs) → `vt` → `draw`.
 
 # Release
@@ -28,7 +28,7 @@
 - `dcs.zig` — DCS DECRQSS (DECSTBM/SGR/DECSCUSR) + iTerm sync + XTGETTCAP + sixel (`sixel.zig`)
 - `draw.zig` — CPU framebuffer; line-dirty fill + SIMD glyph blit; color-emoji RGBA blit; cell-span dirty when a prev snapshot exists; scroll reuse shifts pixels by the best-matching N-row offset (searched only when most lines are dirty; unmatched rows repaint); rows covered by kitty/sixel placements now or last frame repaint (not the whole screen), with clipped placement scaling; DECSCNM reverse; styled/colored underlines; C0 cells are not rasterized; Debug overlay (grid, wrap, LCF, dirty, region, wide, HUD)
 - `type.zig` — TrueType rasterizer, coverage + RGBA atlas, bounded glyph cache (true LRU: hits on the glyph and render paths refresh recency; codepoint+style -> face/glyph resolve memo, 4096 direct-mapped, cleared on font changes); bold/italic faces; CBDT/CBLC color emoji (`type/cbdt.zig`); `type/eastasian.zig` cell width
-- `scheme.zig` — TOML config (colors, font, pad; hz/whitelist parsed but not wired to main/preparse); loads Omarchy current theme; font size from Alacritty, family from fontconfig `monospace` (`omarchy font`); `[font].fallbacks` is an ordered array of up to 16 installed family names (128 bytes each), applied before built-ins; overlays replace the array, `[]` clears custom entries only
+- `scheme.zig` — TOML subset (colors, font, pad; hz/whitelist are legacy parsed settings with no runtime effect; cadence uses the Hyprland monitor rate or 60 Hz). Supported settings use bare table/key names and single-line strings, with basic escapes decoded; unrelated values, quoted names, array tables, multiline strings and nested collections are skipped without full TOML validation (collections are bounded to 64 levels). Integer settings parse directly into checked u32 values; finite font sizes accept exponents and digit separators. Loads Omarchy current theme; font size from Alacritty, then 9 pt only if the current theme's colors.toml is a regular file, otherwise 8 pt; family from fontconfig `monospace` (`omarchy font`). `[font].fallbacks` is an ordered array of up to 16 installed family names (128 bytes each), applied before built-ins; overlays replace the array, `[]` clears custom entries only
 - SIGUSR1/SIGUSR2 or Omarchy theme/font file change reloads colors and font in `main.zig` (`fc-match` needs process environ so HOME/fonts.conf apply); custom and built-in Noto family resolution verifies the matched family so missing names cannot silently load an unrelated substitute; primary patterns keep fontconfig substitution. Linux distro DejaVu/Noto paths remain as defaults; do not hardcode app-specific/user font families.
 - `loop.zig` — unused libxev-shaped scaffolding; the active loop is in `main.zig`
 - `select.zig` — cell-stream selection over `vt.VtState` (drag, double-click word, triple-click line)
@@ -58,8 +58,8 @@
 - PTY backpressure and ordering regression: `zig test tests/pty_queue.c --dep platform -Mroot=tests/pty_queue.zig -Mplatform=src/platform/platform.zig -lc -ldl -lpthread -lutil -lm`.
 
 # Rendering tests
-- Font fallback config checks: `zig test src/scheme.zig -lc -target x86_64-linux-musl` (array order, ownership, overlays, empty reset, malformed input and limits). `src/main.zig` also tests rejection of unrelated fontconfig substitutions and real fallback order/deduplication, primary ASCII and symbol/braille glyphs. The loading smoke test explicitly skips if fontconfig or the two Noto Symbols families are unavailable.
-- Direct current inline check: `zig test src/main.zig src/type/stb_truetype.c src/stb_image.c -Ilib -lc` (102 reported OK with Zig 0.17 targeting `-target x86_64-linux-musl`; overlapping/import-only tests and font early returns are not extra coverage). The musl target avoids host GNU CRT `.sframe` linker incompatibility.
+- Config checks: `zig test src/scheme.zig -lc -target x86_64-linux-musl` (integer precision/overflow, ignored TOML values and array tables, escaped strings, actual theme-file font defaults, fallback array order, ownership, overlays, empty reset, malformed input and limits). `src/main.zig` also tests rejection of unrelated fontconfig substitutions and real fallback order/deduplication, primary ASCII and symbol/braille glyphs. The loading smoke test explicitly skips if fontconfig or the two Noto Symbols families are unavailable.
+- Direct current inline check: `zig test src/main.zig src/type/stb_truetype.c src/stb_image.c -Ilib -lc -target x86_64-linux-musl` (106 reported OK with Zig 0.17; overlapping/import-only tests and font early returns are not extra coverage). The musl target avoids host GNU CRT `.sframe` linker incompatibility.
 - Current `build.zig` does not wire `test` or `fuzz-render`; the `tests/` Zig harness imports the removed `ZT` Engine/Runs API. Commands below are historical, not working build targets. Inline `src/` tests and standalone Peak C checks are separate.
 - Cell dumps: `VtState.dumpAlloc` / `dumpCellsAlloc`; fixtures in `tests/vt/*.in` (first line `cols rows`).
 - PNG goldens: `tests/golden/`; mismatch writes `zig-out/screenshots/<name>` and `<name>.diff.png`.

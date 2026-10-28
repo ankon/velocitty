@@ -1,0 +1,56 @@
+"""Verify release payload names, app metadata, icons and executable permissions."""
+import importlib.util
+from pathlib import Path
+import plistlib
+import tarfile
+import tempfile
+import unittest
+import zipfile
+
+ROOT = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location("package", ROOT / "scripts/package.py")
+packager = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packager)
+
+
+class Packages(unittest.TestCase):
+    def test_linux_layout_and_executable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            binary = temp / "binary"
+            binary.write_bytes(b"ELF fixture")
+            packager.package("1.2.0", "x86_64-linux-musl", binary, temp / "out")
+            with tarfile.open(next((temp / "out").glob("*.tar.gz"))) as archive:
+                files = {item.name: item for item in archive.getmembers()}
+                root = "velocitty-1.2.0-x86_64-linux-musl"
+                self.assertEqual(files[f"{root}/bin/velocitty"].mode, 0o755)
+                self.assertIn(f"{root}/share/applications/velocitty.desktop", files)
+                self.assertIn(f"{root}/share/man/man1/velocitty.1", files)
+                self.assertIn(f"{root}/example.config.toml", files)
+
+    def test_windows_retains_exe_suffix_and_no_linux_desktop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            binary = temp / "fixture.exe"
+            binary.write_bytes(b"MZ fixture")
+            packager.package("1.2.0", "x86_64-windows-gnu", binary, temp / "out", portable_only=True)
+            with zipfile.ZipFile(next((temp / "out").glob("*.zip"))) as archive:
+                self.assertEqual(archive.read("velocitty-1.2.0-x86_64-windows-gnu/velocitty.exe"), b"MZ fixture")
+                self.assertFalse(any(name.endswith(".desktop") for name in archive.namelist()))
+
+    def test_mac_bundle_metadata_and_icon(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            binary = temp / "binary"
+            binary.write_bytes(b"Mach-O fixture")
+            packager.package("1.2.0", "universal-macos", binary, temp / "out", app_only=True)
+            app = temp / "out/Velocitty.app/Contents"
+            info = plistlib.loads((app / "Info.plist").read_bytes())
+            self.assertEqual(info["CFBundleExecutable"], "velocitty")
+            self.assertEqual(info["CFBundleShortVersionString"], "1.2.0")
+            self.assertTrue((app / "Resources/velocitty.icns").read_bytes().startswith(b"icns"))
+            self.assertEqual((app / "MacOS/velocitty").stat().st_mode & 0o777, 0o755)
+
+
+if __name__ == "__main__":
+    unittest.main()

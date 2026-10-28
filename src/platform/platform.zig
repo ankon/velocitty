@@ -48,12 +48,69 @@ pub const Event = union(enum) {
     pub const Clipboard = enum { clipboard, primary };
 
     pub const KeyCode = enum {
-        a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-        num_0, num_1, num_2, num_3, num_4, num_5, num_6, num_7, num_8, num_9,
-        enter, escape, backspace, tab, space,
-        arrow_up, arrow_down, arrow_left, arrow_right,
-        page_up, page_down, home, end, insert, delete,
-        f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12,
+        a,
+        b,
+        c,
+        d,
+        e,
+        f,
+        g,
+        h,
+        i,
+        j,
+        k,
+        l,
+        m,
+        n,
+        o,
+        p,
+        q,
+        r,
+        s,
+        t,
+        u,
+        v,
+        w,
+        x,
+        y,
+        z,
+        num_0,
+        num_1,
+        num_2,
+        num_3,
+        num_4,
+        num_5,
+        num_6,
+        num_7,
+        num_8,
+        num_9,
+        enter,
+        escape,
+        backspace,
+        tab,
+        space,
+        arrow_up,
+        arrow_down,
+        arrow_left,
+        arrow_right,
+        page_up,
+        page_down,
+        home,
+        end,
+        insert,
+        delete,
+        f1,
+        f2,
+        f3,
+        f4,
+        f5,
+        f6,
+        f7,
+        f8,
+        f9,
+        f10,
+        f11,
+        f12,
         unknown,
     };
 
@@ -91,7 +148,7 @@ pub const Window = struct {
     impl: Backend,
 
     const Backend = switch (builtin.os.tag) {
-        .linux => PeakWindow,
+        .linux, .windows, .macos => PeakWindow,
         else => @compileError("Unsupported operating system for platform layer"),
     };
 
@@ -118,6 +175,10 @@ pub const Window = struct {
         return self.impl.pollEvent(ev);
     }
 
+    pub fn scale(self: *Window) f32 {
+        return self.impl.win.scale();
+    }
+
     pub fn eventsPending(self: *Window) bool {
         return self.impl.eventsPending();
     }
@@ -127,7 +188,7 @@ pub const Window = struct {
     }
 
     /// Display connection fd. Poll with the PTY; do not read it.
-    pub fn eventFd(self: *Window) std.posix.fd_t {
+    pub fn eventFd(self: *Window) c_int {
         return self.impl.eventFd();
     }
 
@@ -184,7 +245,7 @@ pub const Pty = struct {
     impl: PtyImpl,
 
     const PtyImpl = switch (builtin.os.tag) {
-        .linux => PeakPty,
+        .linux, .windows, .macos => PeakPty,
         else => @compileError("Unsupported operating system for PTY platform layer"),
     };
 
@@ -214,8 +275,26 @@ pub const Pty = struct {
         self.impl.setWinsize(dims);
     }
 
-    pub fn fd(self: *const Pty) std.posix.fd_t {
+    pub fn fd(self: *const Pty) peak.Handle {
         return self.impl.fd();
+    }
+};
+
+pub const PtySource = struct {
+    pty: *Pty,
+    window: ?*Window = null,
+
+    pub fn read(self: PtySource, dest: []u8) error{ Hangup, WouldBlock }!usize {
+        return switch (peak.fdRead(self.pty.fd(), dest)) {
+            .n => |n| n,
+            .would_block => error.WouldBlock,
+            .eof => error.Hangup,
+        };
+    }
+
+    pub fn wait(self: PtySource, event_fd: ?c_int, timeout_ms: c_int) void {
+        const handles = [_]peak.Handle{self.pty.fd()};
+        _ = peak.peak_wait(if (event_fd != null and self.window != null) &self.window.?.impl.win else null, &handles, 1, timeout_ms);
     }
 };
 
@@ -255,7 +334,7 @@ const PeakWindow = struct {
         self.win.presentRect(y, h);
     }
 
-    pub fn eventFd(self: *PeakWindow) std.posix.fd_t {
+    pub fn eventFd(self: *PeakWindow) c_int {
         return self.win.fd();
     }
 
@@ -344,6 +423,7 @@ const PeakWindow = struct {
                         ev.* = .{ .key_press = .{ .key = key, .mods = modsOf(k.mod), .cp = cpOf(k.key) } };
                         return true;
                     }
+                    if (builtin.os.tag == .macos and k.mod.alt and !k.mod.ctrl and !k.mod.super) continue;
                     if (k.mod.ctrl or k.mod.alt or k.mod.super) {
                         // Peak's code is the layout-produced byte, including
                         // C0 bytes for Control punctuation. Multibyte compose
@@ -461,12 +541,13 @@ const PeakPty = struct {
         };
 
         var cwd_buf: [4096]u8 = undefined;
-        const back: ?[*:0]u8 = if (spawn.cwd != null) getcwd(&cwd_buf, cwd_buf.len) else null;
+        const have_back = spawn.cwd != null and peak.peak_filesystem_cwd(&cwd_buf, cwd_buf.len) != 0;
+        if (spawn.cwd != null and !have_back) return error.OpenPty;
         if (spawn.cwd) |dir| {
-            if (chdir(dir) != 0) return error.OpenPty;
+            if (peak.peak_filesystem_chdir(dir) == 0) return error.OpenPty;
         }
-        defer if (back) |dir| {
-            _ = chdir(dir);
+        defer if (have_back) {
+            _ = peak.peak_filesystem_chdir(@ptrCast(&cwd_buf));
         };
 
         pushChildEnv(dims);
@@ -482,7 +563,7 @@ const PeakPty = struct {
         self.pending.deinit(std.heap.page_allocator);
     }
 
-    pub fn fd(self: *const PeakPty) std.posix.fd_t {
+    pub fn fd(self: *const PeakPty) peak.Handle {
         return self.proc.fd;
     }
 
@@ -529,6 +610,7 @@ const PeakPty = struct {
 
     pub fn setWinsize(self: *PeakPty, dims: Dimensions) void {
         peak.ptyResize(&self.proc, dims.cols, dims.rows, dims.px_w, dims.px_h);
+        if (builtin.os.tag != .linux) return;
         var pgrp: std.os.linux.pid_t = 0;
         if (std.os.linux.tcgetpgrp(self.proc.fd, &pgrp) == 0 and pgrp > 1) {
             _ = std.os.linux.kill(-pgrp, std.os.linux.SIG.WINCH);
@@ -548,10 +630,12 @@ fn modsOf(m: peak.KeyMod) Event.KeyMod {
 }
 
 fn isCopy(k: peak.Key) bool {
+    if (builtin.os.tag == .macos and k.mod.super and !k.mod.ctrl and !k.mod.alt and k.key == .c) return true;
     return k.mod.ctrl and k.mod.shift and !k.mod.alt and k.key == .c;
 }
 
 fn isPaste(k: peak.Key) bool {
+    if (builtin.os.tag == .macos and k.mod.super and !k.mod.ctrl and !k.mod.alt and k.key == .v) return true;
     if (k.mod.shift and !k.mod.ctrl and !k.mod.alt and k.key == .insert) return true;
     return k.mod.ctrl and k.mod.shift and !k.mod.alt and k.key == .v;
 }
@@ -679,17 +763,11 @@ fn nowMs() u32 {
     return @truncate(peak.time() / 1_000_000);
 }
 
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]u8;
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-extern "c" fn getcwd(buf: [*]u8, size: usize) ?[*:0]u8;
-extern "c" fn chdir(path: [*:0]const u8) c_int;
-
+var shell_buf: [4096]u8 = undefined;
 fn shellPath() [*:0]const u8 {
-    if (getenv("SHELL")) |s| {
-        if (s[0] != 0) return s;
-    }
-    return "/bin/sh";
+    const key = if (builtin.os.tag == .windows) "COMSPEC" else "SHELL";
+    if (peak.peak_env_get(key, &shell_buf, shell_buf.len) != 0) return @ptrCast(&shell_buf);
+    return if (builtin.os.tag == .windows) "cmd.exe" else "/bin/sh";
 }
 
 const Saved = struct {
@@ -708,22 +786,18 @@ var save_lines: Saved = .{};
 
 fn remember(slot: *Saved, key: [:0]const u8) void {
     slot.* = .{};
-    const v = getenv(key) orelse return;
-    const span = std.mem.span(v);
-    const n = @min(span.len, slot.buf.len - 1);
-    @memcpy(slot.buf[0..n], span[0..n]);
-    slot.buf[n] = 0;
-    slot.n = n;
+    if (peak.peak_env_get(key, &slot.buf, slot.buf.len) == 0) return;
+    slot.n = std.mem.indexOfScalar(u8, &slot.buf, 0) orelse return;
     slot.had = true;
 }
 
 fn restore(slot: *Saved, key: [:0]const u8) void {
     if (!slot.had) {
-        _ = unsetenv(key);
+        _ = peak.peak_env_set(key, null);
         return;
     }
     slot.buf[slot.n] = 0;
-    _ = setenv(key, slot.buf[0..slot.n :0], 1);
+    _ = peak.peak_env_set(key, slot.buf[0..slot.n :0]);
 }
 
 fn pushChildEnv(dims: Dimensions) void {
@@ -734,19 +808,19 @@ fn pushChildEnv(dims: Dimensions) void {
     remember(&save_listen, "KITTY_LISTEN_ON");
     remember(&save_columns, "COLUMNS");
     remember(&save_lines, "LINES");
-    _ = setenv("TERM", "xterm-256color", 1);
-    _ = setenv("COLORTERM", "truecolor", 1);
-    _ = setenv("TERM_PROGRAM", "velocitty", 1);
+    _ = peak.peak_env_set("TERM", "xterm-256color");
+    _ = peak.peak_env_set("COLORTERM", "truecolor");
+    _ = peak.peak_env_set("TERM_PROGRAM", "velocitty");
     var id_buf: [32]u8 = undefined;
     const id = std.mem.printSentinel(&id_buf, "{d}", .{peak.pid()}, 0) catch "1";
-    _ = setenv("KITTY_WINDOW_ID", id, 1);
-    _ = unsetenv("KITTY_LISTEN_ON");
+    _ = peak.peak_env_set("KITTY_WINDOW_ID", id);
+    _ = peak.peak_env_set("KITTY_LISTEN_ON", null);
     var col_buf: [16]u8 = undefined;
     var row_buf: [16]u8 = undefined;
     const cols = std.mem.printSentinel(&col_buf, "{d}", .{dims.cols}, 0) catch "80";
     const rows = std.mem.printSentinel(&row_buf, "{d}", .{dims.rows}, 0) catch "24";
-    _ = setenv("COLUMNS", cols, 1);
-    _ = setenv("LINES", rows, 1);
+    _ = peak.peak_env_set("COLUMNS", cols);
+    _ = peak.peak_env_set("LINES", rows);
 }
 
 fn popChildEnv() void {

@@ -1,4 +1,4 @@
-.TH VELOCITTY 1 "September 2026" "velocitty 0.2.0" "Velocitty Terminal Emulator"
+.TH VELOCITTY 1 "October 2026" "velocitty 1.2.0" "Velocitty Terminal Emulator"
 .SH NAME
 velocitty \- CPU-rendered terminal emulator
 .SH SYNOPSIS
@@ -8,7 +8,9 @@ velocitty \- CPU-rendered terminal emulator
 .IR command " [" arg "...]]"
 .SH DESCRIPTION
 .B velocitty
-is a CPU-rendered terminal emulator.
+is a CPU-rendered terminal emulator for Linux, Windows, and macOS, designed
+first for Omarchy. Peak supplies Wayland/X11 on Linux, Win32/ConPTY on
+Windows 10 1903 or later, and AppKit/POSIX PTYs on macOS 11 or later.
 It is designed to keep up with high-volume output such as
 .BR cat (1)
 of large files: PTY input is truncated through a mirrored circular buffer,
@@ -21,6 +23,10 @@ command, the child is
 .B $SHELL
 (or
 .B /bin/sh
+if unset) on Linux/macOS. Windows uses
+.B COMSPEC
+(or
+.B cmd.exe
 if unset). The child environment sets
 .BR TERM = xterm-256color
 (SSH-safe terminfo),
@@ -35,10 +41,22 @@ Window class and title follow
 /
 .B \-\-title
 and may be updated by OSC 176 and OSC 0/2. Geometry, font size, and inner
-padding use CSS 96 DPI times a Hyprland /
+padding use CSS 96 DPI times the desktop scale: Hyprland /
 .B GDK_SCALE
-multiplier (not X11 millimetre DPI), reapplied on focus and resize only when
-the scale or grid actually changes.
+on Linux, per-monitor DPI on Windows, and the Retina backing scale on macOS.
+Metrics are reapplied on focus and resize when the scale or grid changes.
+.SH PACKAGES
+Linux releases include GNU and dynamically linked musl tarballs for x86_64
+and aarch64. Musl builds require the target system's musl loader and native
+Wayland/X11 libraries (for example, Alpine Linux). They are not static binaries.
+.PP
+Windows releases provide a per-user Inno Setup installer and a portable ZIP.
+macOS releases provide a universal Intel/Apple Silicon app in a DMG; drag
+Velocitty.app to Applications.
+.PP
+Windows/macOS packages are unsigned. If Windows shows SmartScreen, choose
+More info, then Run anyway. On macOS, allow Velocitty in System Settings,
+Privacy & Security after the first launch attempt.
 .SH OPTIONS
 .TP
 .BR \-e ", " \-\- " " \fIcommand\fR " [" \fIarg\fR ...]
@@ -49,7 +67,7 @@ in the PTY instead of the shell. All following arguments are passed to
 Must be last among options.
 .TP
 .BR \-\-class " " \fIname\fR
-ICCCM / WM_CLASS instance name (also
+Linux WM_CLASS instance / Wayland app-id (also
 .BR \-\-class= name ).
 Default:
 .BR velocitty .
@@ -68,7 +86,7 @@ Used by
 .SH KEY BINDINGS
 .TP
 .B Ctrl+Shift+C
-Copy the current selection to CLIPBOARD (UTF8_STRING).
+Copy the current selection to the system clipboard.
 .TP
 .B Ctrl+Shift+V
 Paste CLIPBOARD into the PTY (bracketed paste if DECSET 2004 is on).
@@ -76,43 +94,61 @@ Paste CLIPBOARD into the PTY (bracketed paste if DECSET 2004 is on).
 .B Shift+Insert
 Same as Ctrl+Shift+V.
 .PP
+On macOS, Command+C and Command+V also copy and paste; Command+W or
+Command+Q closes the window.
+.PP
 Other keys are sent as VT sequences (including application-cursor keys when
 the application has enabled them).
 .SH MOUSE
 Left-drag selects a cell stream. Double-click selects a word; triple-click
-selects a line. Releasing the button copies the selection to PRIMARY.
+selects a line. Releasing the button copies the selection to PRIMARY
+(the Linux primary selection, or a terminal-local selection on Windows/macOS).
 .PP
 When mouse reporting is enabled (DECSET 1000/1002/1003, SGR/urxvt/pixel
 modes), Shift+drag still selects instead of reporting. Middle-click pastes
 PRIMARY. Wheel events go to the application when reporting, otherwise scroll
 the primary screen history or send arrow keys on the alternate screen.
 .SH CONFIGURATION
-Config is TOML, similar to Alacritty. Unknown keys are ignored.
+Config uses a TOML subset, similar to Alacritty. Supported settings use bare
+table/key names and single-line quoted strings (including basic string escapes).
+Integers are nonnegative decimal values; font sizes also accept finite floats
+with exponents and digit separators. Unknown keys and tables are skipped,
+including array tables, multiline strings, and nested arrays or inline tables
+(up to 64 levels). The parser does not fully validate TOML.
 .PP
-Load order (later files overlay earlier; Omarchy theme colors win when
-present):
+Load order (later files overlay earlier; Omarchy theme colors win on Linux
+when present):
 .IP 1. 3
+The platform user config: Linux
+.IR ~/.config/velocitty/config.toml ,
+Windows
+.IR %APPDATA%/velocitty/config.toml ,
+or macOS
+.IR "~/Library/Application Support/velocitty/config.toml" .
+If set,
 .I $XDG_CONFIG_HOME/velocitty/config.toml
-(default
-.IR ~/.config/velocitty/config.toml )
+overrides the platform location.
 .IP 2.
 .I ./config.toml
 in the current working directory
 .IP 3.
-Omarchy current theme
+Linux Omarchy current theme
 .I colors.toml
 .IP 4.
-Omarchy current theme
+Linux Omarchy current theme
 .I alacritty.toml
 .PP
 If
 .B [font].size
 is still unset, size is taken from
 .IR ~/.config/alacritty/alacritty.toml ,
-then 9 when an Omarchy theme is in use. Unset family is resolved with
+then 9 pt if the current Omarchy theme's
+.I colors.toml
+exists, otherwise 8 pt. The default family is
+.BR monospace :
 fontconfig
-.B monospace
-.RB ( "omarchy font current" ).
+.RB ( "omarchy font current" )
+on Linux, Consolas on Windows, or Menlo on macOS.
 .SS Colors
 Root or
 .B [colors]
@@ -136,20 +172,22 @@ keys such as
 and root-level ANSI names are accepted.
 .SS [general]
 .TP
-.BR refreshrate " / " hz
-Target redraw rate in Hz when PTY reads return EAGAIN. Default: 30.
-.TP
-.B whitelist
-If true, parse a whitelist of escape sequences during line split (payloads
-may contain newline bytes). Default: false (split on newlines only).
-.TP
 .BR pad " / " padding
 Inner window margin in CSS pixels, all sides. Default: 14. Scaled by the
 output scale factor.
+.PP
+Legacy
+.BR refreshrate " (" hz ")"
+and
+.B whitelist
+settings are parsed for compatibility but currently have no effect.
+Refresh cadence follows the Hyprland monitor refresh rate, or 60 Hz otherwise.
 .SS [font]
 .TP
 .BR family " / " font " / " font_family
-Fontconfig family name. Default: fontconfig
+Installed family name, resolved with fontconfig on Linux, GDI on Windows,
+and Core Text on macOS. Linux primary families may use fontconfig patterns.
+Default:
 .BR monospace .
 .TP
 .B fallbacks
@@ -160,16 +198,17 @@ fallbacks = ["Symbols Nerd Font Mono", "Noto Sans Symbols 2"]
 .fi
 Missing families and duplicate font files are skipped; names must match an
 installed family (case-insensitive), not a fontconfig pattern or generic alias.
-Built-in DejaVu and Noto symbol, CJK, and color emoji fallbacks remain enabled,
-including when this array is empty (the default). The renderer retains its
-color-emoji preference. Fonts must already be installed.
+Built-in platform symbol, CJK, and emoji coverage fonts remain enabled,
+including when this array is empty (the default). Color-emoji availability
+depends on the installed font format. Fonts must already be installed.
 Maximum: 16 names, 128 bytes per name. A later config array replaces the
 previous array; an empty array clears only the user list. Reload with
 SIGUSR1 or SIGUSR2, or let the config watcher detect the change.
 .TP
 .BR size " / " font_size
-Point size. Default: Alacritty config, else 9 under Omarchy, else the
-built-in fallback fonts.
+Point size. Default: Alacritty config, else 9 pt if the current Omarchy theme's
+.I colors.toml
+exists, else 8 pt.
 .PP
 Example:
 .PP
@@ -189,8 +228,6 @@ black = "#928374"
 # ...
 
 [general]
-refreshrate = 30
-whitelist = false
 pad = 14
 
 [font]
@@ -202,12 +239,13 @@ size = 16
 .SH ENVIRONMENT
 .TP
 .B HOME
-Used to locate config, Omarchy state, and fontconfig.
+Used to locate Unix config, Omarchy state, and fontconfig.
 .TP
 .B XDG_CONFIG_HOME
 Overrides
 .IR ~/.config
-for user config and Alacritty overlay.
+for user config and the Alacritty size fallback. User config overrides apply
+on all three platforms.
 .TP
 .B XDG_STATE_HOME
 Overrides
@@ -215,12 +253,20 @@ Overrides
 for Omarchy current theme paths.
 .TP
 .B SHELL
-Child program when
+Linux/macOS child program when
 .B \-e
 is not given.
 .TP
+.B COMSPEC
+Windows child program when
+.B \-e
+is not given.
+.TP
+.B APPDATA
+Windows user-config root; USERPROFILE/AppData/Roaming is the fallback.
+.TP
 .B GDK_SCALE ", " QT_SCALE_FACTOR
-UI scale fallback when Hyprland scale is unavailable.
+Linux UI scale fallback when Hyprland scale is unavailable.
 .TP
 .B TERM ", " COLORTERM ", " TERM_PROGRAM ", " KITTY_WINDOW_ID
 Set in the child. Incoming
@@ -229,23 +275,32 @@ is cleared.
 .SH SIGNALS
 .TP
 .BR SIGUSR1 ", " SIGUSR2
-Reload colors and font from config and the current Omarchy theme without
-restarting. Theme/font file changes are also watched (throttled) and trigger
-the same reload; CSI 2031 is sent when the palette changes.
+On Linux/macOS, reload colors and font from config without restarting.
+On Linux this also reloads the current Omarchy theme. Config/theme/font file
+changes are watched (throttled) on all platforms and trigger the same reload;
+CSI 2031 is sent when the palette changes.
 .TP
 .B SIGWINCH
 Sent to the slave foreground process group after
 .B TIOCSWINSZ
-on resize.
+on Linux/macOS resize; Windows resizes the ConPTY.
 .SH FILES
 .TP
-.I $XDG_CONFIG_HOME/velocitty/config.toml
-User configuration.
+.I ~/.config/velocitty/config.toml
+Linux user configuration.
+.TP
+.I %APPDATA%/velocitty/config.toml
+Windows user configuration.
+.TP
+.I "~/Library/Application Support/velocitty/config.toml"
+macOS user configuration.
+.PP
+XDG_CONFIG_HOME overrides the platform user-config root.
 .TP
 .I $XDG_STATE_HOME/omarchy/current/theme/colors.toml
 .TQ
 .I $XDG_STATE_HOME/omarchy/current/theme/alacritty.toml
-Omarchy live theme (overlaid on user config).
+Linux Omarchy live theme (overlaid on user config).
 .TP
 .I $XDG_CONFIG_HOME/alacritty/alacritty.toml
 Font size fallback when unset.
@@ -257,7 +312,10 @@ cwd, notify, alpha, selection, cursor shape, OSC 52 clipboard, OSC 176
 app-id), DCS (DECRQSS, iTerm sync, XTGETTCAP, sixel), and kitty graphics
 (APC G, including
 .B a=q
-replies for icat).
+replies for icat). File/temporary-file kitty transfers and desktop
+notifications currently use the Linux implementation. On Windows/macOS,
+use streamed image transfers (for example,
+.BR "icat --transfer-mode=stream" ).
 .PP
 DECSET 2026 and iTerm DCS
 .B =1s
@@ -274,8 +332,7 @@ Ignored in Release.
 .BR fc-match (1),
 .BR xdg-terminal-exec (1)
 .SH BUGS
-macOS and Windows targets are not supported yet. There is no GPU renderer,
-no multiplexer, and no kitty-style CTL.
+There is no GPU renderer, no multiplexer, and no kitty-style CTL.
 .SH AUTHOR
 Vasco Alves
 .SH COPYRIGHT

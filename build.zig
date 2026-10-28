@@ -2,23 +2,45 @@ const std = @import("std");
 
 const targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
-    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+    .{ .cpu_arch = .x86_64, .os_tag = .macos },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 } },
     .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
-    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 28, .patch = 0 } },
     .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
-    .{ .cpu_arch = .x86_64, .os_tag = .windows },
+    .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
 };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const macos_sdk = b.option([]const u8, "macos-sdk", "macOS SDK directory for cross-compilation");
+    const release_os = b.option(std.Target.Os.Tag, "release-os", "Restrict release/package builds to one operating system");
 
     // Main build step (optimize from -Doptimize / --release; default Debug).
-    const exe = buildExeForTarget(b, target, optimize);
+    const exe = buildExeForTarget(b, target, optimize, macos_sdk);
     b.installArtifact(exe);
-    b.installFile("velocitty.desktop", "share/applications/velocitty.desktop");
-    b.installFile("icon.png", "share/icons/hicolor/512x512/apps/velocitty.png");
-    b.installFile("velocitty.1", "share/man/man1/velocitty.1");
+    if (target.result.os.tag == .linux) {
+        b.installFile("velocitty.desktop", "share/applications/velocitty.desktop");
+        b.installFile("icon.png", "share/icons/hicolor/512x512/apps/velocitty.png");
+        b.installFile("velocitty.1", "share/man/man1/velocitty.1");
+    }
+    const tests_mod = appModule(b, target, optimize, "src/port_test.zig", macos_sdk);
+    const tests = b.addTest(.{ .root_module = tests_mod });
+    if (target.result.os.tag == .windows) tests.win32_manifest = b.path("velocitty.manifest");
+    const test_run = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run inline and portable Peak regressions");
+    test_step.dependOn(&test_run.step);
+    const native_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    addPeakSource(native_mod, b, target, "tests/peak_native.c");
+    addMacSdk(native_mod, b, target, macos_sdk);
+    const native_tests = b.addExecutable(.{ .name = "peak-native-test", .root_module = native_mod });
+    if (target.result.os.tag == .windows) native_tests.win32_manifest = b.path("velocitty.manifest");
+    const native_run = b.addRunArtifact(native_tests);
+    test_step.dependOn(&native_run.step);
+    const check_step = b.step("check", "Compile the app and tests without running them");
+    check_step.dependOn(&exe.step);
+    check_step.dependOn(&tests.step);
+    check_step.dependOn(&native_tests.step);
 
     // Standard run step
     const run_cmd = b.addRunArtifact(exe);
@@ -46,20 +68,23 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run PTY pipeline, glyph cache and render benchmarks (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
 
-    // Release: Linux gnu/musl, x86_64 and aarch64. Peak compiles against
-    // host X11 and Wayland headers and dlopens them at runtime.
-    const release_step = b.step("release", "Build optimized velocitty for all target platforms");
-    const package_step = b.step("package", "Build release and write tar.gz archives to packages/");
+    // Each OS uses its native SDK; Linux hosts can also build Windows directly.
+    const release_step = b.step("release", "Build ReleaseFast binaries for available target SDKs");
+    const package_step = b.step("package", "Build native tar.gz, Windows ZIP/installer, and macOS DMG packages");
     package_step.dependOn(release_step);
 
     const version = @import("build.zig.zon").version;
 
     for (targets) |query| {
         const resolved = b.resolveTargetQuery(query);
-        if (!canLinkReleaseTarget(b, resolved)) continue;
-        const triple = query.zigTriple(b.allocator) catch @panic("OOM");
+        if (release_os) |os| if (resolved.result.os.tag != os) continue;
+        if (!canLinkReleaseTarget(resolved, macos_sdk)) continue;
+        // Keep ABI version requirements in the binary, not in artifact names.
+        var package_query = query;
+        package_query.glibc_version = null;
+        const triple = package_query.zigTriple(b.allocator) catch @panic("OOM");
 
-        const exe_rel = buildExeForTarget(b, resolved, .ReleaseFast);
+        const exe_rel = buildExeForTarget(b, resolved, .ReleaseFast, macos_sdk);
 
         const install = b.addInstallArtifact(exe_rel, .{
             .dest_dir = .{ .override = .{ .custom = triple } },
@@ -67,16 +92,15 @@ pub fn build(b: *std.Build) void {
 
         release_step.dependOn(&install.step);
 
-        const pkg_cmd = b.addSystemCommand(&.{"bash"});
-        pkg_cmd.addFileArg(b.path("scripts/package.sh"));
+        const pkg_cmd = b.addSystemCommand(&.{if (@import("builtin").os.tag == .windows) "python" else "python3"});
+        pkg_cmd.addFileArg(b.path("scripts/package.py"));
         pkg_cmd.addArg(version);
         pkg_cmd.addArg(triple);
         pkg_cmd.addArtifactArg(exe_rel);
-        pkg_cmd.addFileArg(b.path("velocitty.desktop"));
-        pkg_cmd.addFileArg(b.path("icon.png"));
-        pkg_cmd.addFileArg(b.path("velocitty.1"));
+
         // Relative to the build root (cwd below).
         pkg_cmd.addArg("packages");
+        if (resolved.result.os.tag == .windows and @import("builtin").os.tag != .windows) pkg_cmd.addArg("--portable-only");
         pkg_cmd.setCwd(b.path("."));
         pkg_cmd.stdio = .inherit;
         pkg_cmd.has_side_effects = true;
@@ -89,7 +113,7 @@ pub fn build(b: *std.Build) void {
     // host ReleaseFast copy to /usr so it shows up on PATH and the Omarchy menu.
     // Privilege: sudo when stdin is a TTY, pkexec (polkit dialog) otherwise.
     const host_target = b.resolveTargetQuery(.{});
-    const usr_exe = buildExeForTarget(b, host_target, .ReleaseFast);
+    const usr_exe = buildExeForTarget(b, host_target, .ReleaseFast, macos_sdk);
     const usr_cmd = b.addSystemCommand(&.{"bash"});
     usr_cmd.addFileArg(b.path("scripts/install-usr.sh"));
     usr_cmd.addArtifactArg(usr_exe);
@@ -105,9 +129,11 @@ pub fn build(b: *std.Build) void {
     usr_step.dependOn(&usr_cmd.step);
 }
 
-fn canLinkReleaseTarget(_: *std.Build, target: std.Build.ResolvedTarget) bool {
+fn canLinkReleaseTarget(target: std.Build.ResolvedTarget, macos_sdk: ?[]const u8) bool {
     const t = target.result;
-    if (t.os.tag != .linux) return false;
+    if (t.os.tag == .windows) return true;
+    if (t.os.tag == .macos) return @import("builtin").os.tag == .macos or macos_sdk != null;
+    if (t.os.tag != .linux or @import("builtin").os.tag != .linux) return false;
     return t.abi == .gnu or t.abi == .musl;
 }
 
@@ -115,42 +141,78 @@ fn buildExeForTarget(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    macos_sdk: ?[]const u8,
 ) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{ .name = "velocitty", .root_module = appModule(b, target, optimize, "src/main.zig", macos_sdk) });
+    // Static musl cannot dlopen Peak's native window libraries. These artifacts
+    // target musl distributions (e.g. Alpine) with their real runtime libraries.
+    if (target.result.os.tag == .linux and target.result.abi == .musl) exe.linkage = .dynamic;
+    if (target.result.os.tag == .windows) {
+        exe.subsystem = .windows;
+        exe.win32_manifest = b.path("velocitty.manifest");
+        exe.root_module.addWin32ResourceFile(.{ .file = b.path("velocitty.rc"), .include_paths = &.{b.path(".")} });
+    }
+    return exe;
+}
+
+fn appModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, root: []const u8, macos_sdk: ?[]const u8) *std.Build.Module {
     const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path(root),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
 
     addStbTrueType(exe_mod, b);
-    if (target.result.os.tag == .linux) addPeak(exe_mod, b, target);
+    exe_mod.addCSourceFile(.{ .file = b.path("src/platform/font.c"), .flags = &.{"-std=c99"} });
+    addPeak(exe_mod, b, target);
+    addMacSdk(exe_mod, b, target, macos_sdk);
+    return exe_mod;
+}
 
-    const exe = b.addExecutable(.{
-        .name = "velocitty",
-        .root_module = exe_mod,
-    });
-
-    return exe;
+fn addMacSdk(mod: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget, macos_sdk: ?[]const u8) void {
+    if (target.result.os.tag == .macos) {
+        if (macos_sdk) |sdk| {
+            mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
+            mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+            mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
+        }
+    }
 }
 
 fn addPeak(mod: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget) void {
+    addPeakSource(mod, b, target, "vendor/godstack/Peak/peak.c");
+}
+
+fn addPeakSource(mod: *std.Build.Module, b: *std.Build, target: std.Build.ResolvedTarget, source: []const u8) void {
     mod.addIncludePath(b.path("vendor/godstack/Peak"));
     // X11 and Wayland headers. After Zig's libc so host bits/math.h
     // cannot shadow the target headers. Those libraries are dlopened.
-    mod.addAfterIncludePath(.{ .cwd_relative = "/usr/include" });
+    if (target.result.os.tag == .linux) mod.addAfterIncludePath(.{ .cwd_relative = "/usr/include" });
     mod.addCSourceFile(.{
-        .file = b.path("vendor/godstack/Peak/peak.c"),
+        .file = b.path(source),
         // Gaming mice can also expose /dev/input/js*: never turn their
         // global joystick events into clicks in every terminal window.
-        .flags = &.{ "-std=c99", "-Wno-deprecated-declarations", "-DPEAK_NO_GAMEPAD" },
+        .flags = if (target.result.os.tag == .macos)
+            &.{ "-x", "objective-c", "-fblocks", "-std=c99", "-Wno-deprecated-declarations", "-DPEAK_NO_GAMEPAD" }
+        else
+            &.{ "-std=c99", "-Wno-deprecated-declarations", "-DPEAK_NO_GAMEPAD" },
     });
     // musl folds dl, pthread, and openpty into libc.
-    if (target.result.abi != .musl and target.result.abi != .none) {
+    if (target.result.os.tag == .linux and target.result.abi != .musl and target.result.abi != .none) {
         const lib: std.Build.Module.LinkSystemLibraryOptions = .{ .use_pkg_config = .no };
         mod.linkSystemLibrary("dl", lib);
         mod.linkSystemLibrary("pthread", lib);
         mod.linkSystemLibrary("util", lib);
+    }
+    if (target.result.os.tag == .macos) {
+        mod.linkSystemLibrary("objc", .{});
+        for ([_][]const u8{ "AppKit", "AudioToolbox", "CoreGraphics", "QuartzCore", "CoreText", "CoreFoundation" }) |framework| {
+            mod.linkFramework(framework, .{});
+        }
+    }
+    if (target.result.os.tag == .windows) {
+        for ([_][]const u8{ "user32", "gdi32", "shell32", "advapi32" }) |lib| mod.linkSystemLibrary(lib, .{});
     }
 }
 

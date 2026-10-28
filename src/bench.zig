@@ -41,6 +41,7 @@ const Options = struct {
     samples: u32 = 200,
     font: ?[]const u8 = null,
     only: ?[]const u8 = null,
+    dump: ?[]const u8 = null,
     help: bool = false,
 };
 
@@ -54,6 +55,8 @@ const usage =
     \\  --font PATH       primary font (default: fc-match monospace, like main.zig)
     \\  --only A,B        sections: ascii unicode grapheme csi-short long-escape
     \\                    kitty-image sixel glyph render
+    \\  --dump DIR        write each workload (--mib, --only) to DIR/<name>.bin and exit;
+    \\                    for timing other terminals with `cat`
     \\  --help
     \\Pipeline rows: one frame = read one burst from a real PTY (writer thread,
     \\raw slave), consumeAndGetRuns, feedRuns, renderSel, damaged-rows copy (present).
@@ -98,6 +101,8 @@ fn parseOptions(args: []const [*:0]const u8) !Options {
             opt.font = value;
         } else if (std.mem.eql(u8, name, "--only")) {
             opt.only = value;
+        } else if (std.mem.eql(u8, name, "--dump")) {
+            opt.dump = value;
         } else return error.UnknownOption;
     }
     if (opt.quick) {
@@ -154,6 +159,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = init.environ });
     defer threaded.deinit();
     const io = threaded.io();
+    if (opt.dump) |dir| return dumpWorkloads(io, gpa, opt, dir);
     var log: Log = .{ .buffer = .init(gpa) };
     defer log.buffer.deinit();
 
@@ -225,6 +231,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try renderSuite(&log, &env, big_cols, big_rows, @max(10, opt.samples / 5));
     }
     try saveLog(io, &log, stamp.file, git.hash, std.mem.eql(u8, git.status, "dirty"));
+}
+
+fn dumpWorkloads(io: std.Io, gpa: std.mem.Allocator, opt: Options, dir: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, dir);
+    for (workloads) |wl| {
+        if (!wanted(opt, wl.name)) continue;
+        const bytes = try generate(gpa, wl, @as(usize, opt.mib) << 20);
+        defer gpa.free(bytes);
+        var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&name_buf, "{s}/{s}.bin", .{ dir, wl.name });
+        try cwd.writeFile(io, .{ .sub_path = path, .data = bytes });
+        std.debug.print("wrote {s} ({d} bytes)\n", .{ path, bytes.len });
+    }
 }
 
 // ---------------------------------------------------------------- statistics

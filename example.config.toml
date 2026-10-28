@@ -1,4 +1,9 @@
-# gruvbox dark
+# Gruvbox dark. Copy to your platform config file:
+# Linux: ~/.config/velocitty/config.toml
+# Windows: %APPDATA%/velocitty/config.toml
+# macOS: ~/Library/Application Support/velocitty/config.toml
+# XDG_CONFIG_HOME overrides these locations when set.
+# On Linux, Omarchy theme colors overlay this palette when a current theme is present.
 foreground = "#ebdbb2"
 background = "#282828"
 cursor = "#ebdbb2"
@@ -24,13 +29,17 @@ cyan = "#8ec07c"
 white = "#ebdbb2"
 
 [general]
-refreshrate = 30
-whitelist = false
 pad = 14
+# Legacy refreshrate/hz and whitelist keys are parsed but currently ignored.
+# Cadence follows the Hyprland monitor refresh rate, or 60 Hz otherwise.
 
 [font]
+# Linux uses fontconfig; Windows/macOS use installed native font families.
+# "monospace" defaults to the desktop font, Consolas on Windows, or Menlo on macOS.
 family = "monospace"
-# Extra installed families, in order, before built-in DejaVu/Noto fallbacks.
+# Extra installed families, in order, before built-in platform fallbacks.
 # fallbacks = ["Symbols Nerd Font Mono"]
 fallbacks = []
+# Point size. Omit to use Alacritty's size, then 9 pt with an Omarchy theme,
+# or 8 pt otherwise.
 size = 16
