@@ -13,8 +13,12 @@
     <br />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"></a>
     <a href="https://github.com/valvesky/velocitty"><img src="https://img.shields.io/github/languages/top/valvesky/velocitty?style=flat-square" alt="Language"></a>
+    <a href="https://github.com/valvesky/velocitty/releases/latest"><img src="https://img.shields.io/github/v/release/valvesky/velocitty?style=flat-square" alt="Latest release"></a>
+    <a href="https://github.com/valvesky/velocitty/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/valvesky/velocitty/release.yml?branch=main&style=flat-square" alt="Build"></a>
     <img src="https://img.shields.io/badge/Linux-FCC624?style=flat-square&logo=linux&logoColor=black" alt="Linux">
-    <a href="https://github.com/valvesky/velocitty/commits/master"><img src="https://img.shields.io/github/last-commit/valvesky/velocitty?style=flat-square" alt="Last commit"></a>
+    <img src="https://img.shields.io/badge/Windows-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Windows">
+    <img src="https://img.shields.io/badge/macOS-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS">
+    <a href="https://github.com/valvesky/velocitty/commits/main"><img src="https://img.shields.io/github/last-commit/valvesky/velocitty?style=flat-square" alt="Last commit"></a>
     <a href="https://github.com/valvesky/velocitty/stargazers"><img src="https://img.shields.io/github/stars/valvesky/velocitty?style=flat-square" alt="Stars"></a>
     <br />
     <a href="#features">Features</a>
