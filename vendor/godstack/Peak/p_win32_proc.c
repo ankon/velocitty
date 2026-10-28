@@ -320,6 +320,12 @@ peak_pty_spawn(const char *file, const char **argv, uint32_t cols, uint32_t rows
 	out_w = NULL;
 	memset(&si, 0, sizeof si);
 	si.StartupInfo.cb = sizeof si;
+	/* Without explicit invalid stdio, a child of a redirected parent writes to
+	 * the parent's pipes instead of the pseudoconsole. */
+	si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+	si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+	si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
 	attr_n = 0;
 	InitializeProcThreadAttributeList(NULL, 1, 0, &attr_n);
 	si.lpAttributeList = malloc(attr_n);
