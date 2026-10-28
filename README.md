@@ -1,14 +1,9 @@
-```
- ▄█    █▄     ▄████████  ▄█        ▄██████▄   ▄████████  ▄█      ███         ███     ▄██   ▄   
-███    ███   ███    ███ ███       ███    ███ ███    ███ ███  ▀█████████▄ ▀█████████▄ ███   ██▄ 
-███    ███   ███    █▀  ███       ███    ███ ███    █▀  ███▌    ▀███▀▀██    ▀███▀▀██ ███▄▄▄███ 
-███    ███  ▄███▄▄▄     ███       ███    ███ ███        ███▌     ███   ▀     ███   ▀ ▀▀▀▀▀▀███ 
-███    ███ ▀▀███▀▀▀     ███       ███    ███ ███        ███▌     ███         ███     ▄██   ███ 
-███    ███   ███    █▄  ███       ███    ███ ███    █▄  ███      ███         ███     ███   ███ 
-███    ███   ███    ███ ███▌    ▄ ███    ███ ███    ███ ███      ███         ███     ███   ███ 
- ▀██████▀    ██████████ █████▄▄██  ▀██████▀  ████████▀  █▀      ▄████▀      ▄████▀    ▀█████▀  
-                        ▀
-```
+<p align="center">
+  <picture>
+    <source srcset="assets/wordmark.svg" media="(prefers-reduced-motion: reduce)">
+    <img src="assets/velocitty.gif" alt="Velocitty" width="960">
+  </picture>
+</p>
 
 <p align="center">
     <br />
@@ -29,19 +24,19 @@
     <a href="#shoutouts">Shoutouts</a>
 </p>
 
-Velocitty is a lightning-fast terminal for omarchy.
+Velocitty is a lightning-fast terminal for Omarchy, Windows, and macOS.
 
 It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https://github.com/valvesky/velocitty).
 
 ## Features
 - Lightning fast (literally bottlenecked by the kernel)
 - `cat` large files.
-- Cross-platform.
+- Cross-platform through Peak: Linux (Wayland/X11), Windows (ConPTY), and macOS (AppKit).
 - CPU rendered.
 - Image support (sixel)
 - Extensive unicode support.
 - Simple config file.
-- No external dependencies.
+- Uses native system libraries and fonts.
 - Omarchy color palette change and font change (live reloaded).
 
 ## Anti-Features
@@ -51,26 +46,43 @@ It's a streamlined version of my GPU-accelerated terminal multiplexer [VT](https
 
 ## Install
 
-### Releases
+Download from [releases](https://github.com/valvesky/velocitty/releases).
 
-See [releases](https://github.com/valvesky/velocitty/releases) tab.
-Unzip then copy to `/usr/bin`
+- **Linux:** GNU and musl tarballs for x86_64 and aarch64. Extract the archive and install the binary, desktop entry, icon, and man page under your preferred prefix.
+- **Windows 10 1903+:** run the per-user installer `.exe`, or extract the portable `.zip` and launch `velocitty.exe`.
+- **macOS 11+:** open the universal `.dmg` and drag `Velocitty.app` into Applications. It supports Intel and Apple Silicon.
 
-### By Building From Master
+Windows and macOS packages are unsigned. If Windows shows SmartScreen, use **More info → Run anyway**. On macOS, allow Velocitty in **System Settings → Privacy & Security** after the first launch attempt.
 
-Just clone the repo and run:
+Musl packages use dynamic linking: install them on a musl system such as Alpine, with its musl loader and native Wayland/X11 libraries. GNU packages are for glibc systems such as Omarchy. `SHA256SUMS` accompanies the release downloads.
+
+## Build
+
+Requires Zig 0.17 or newer. Linux builds need X11/Wayland development headers; the terminal loads the desktop libraries at runtime and uses `fc-match` for font discovery. macOS builds need Xcode Command Line Tools. Windows builds use Zig's bundled toolchain and system libraries.
+
 ```
-git clone --recursive https://github.com/valvesky/velocitty 
+git clone --recursive https://github.com/valvesky/velocitty
 cd velocitty
-zig build install-usr
+zig build -Doptimize=ReleaseFast
 ```
+
+The executable is installed in `zig-out/bin/`. On Omarchy, `zig build install-usr` installs the terminal and app-menu entry under `/usr`.
+
+`zig build test` runs inline and portable Peak regressions. `zig build check` compiles the app and tests without running them, useful for cross-compilation. Release/package builds can be restricted with `-Drelease-os=linux`, `windows`, or `macos`; Windows installers need Inno Setup 6, and DMG creation runs on macOS.
 
 ## Config
 
-Config file is `~/.config/velocitty/config.toml` and will be overwritten by omarchy color scheme.
+| Platform | Default config file |
+| --- | --- |
+| Linux | `~/.config/velocitty/config.toml` |
+| Windows | `%APPDATA%/velocitty/config.toml` |
+| macOS | `~/Library/Application Support/velocitty/config.toml` |
 
-See `example.config.toml` for an example config file.
-It's purposefully similar to `alacritty` in many ways.
+`$XDG_CONFIG_HOME/velocitty/config.toml` overrides these locations when set. A `config.toml` in the working directory overlays the user file. On Linux, Omarchy theme colors overlay the configured palette without rewriting the file.
+
+See [example.config.toml](example.config.toml). The TOML subset is similar to Alacritty. Font families use fontconfig on Linux, GDI on Windows, and Core Text on macOS; `monospace` selects the desktop/default monospace font. Installed fallback families can be listed in priority order. Config changes reload automatically; Linux/macOS also accept SIGUSR1 or SIGUSR2.
+
+Desktop notifications and kitty file/temporary-file image transfers currently use the Linux implementation. Streamed kitty graphics and sixel work across platforms; use `icat --transfer-mode=stream` on Windows/macOS.
 
 ## Shoutouts
 - [vt](https://github.com/valvesky/vt) --- older brother
